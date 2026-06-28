@@ -1,0 +1,58 @@
+# Environment
+.env
+.env.local
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pycache
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Z3 temp files
+*.py.tmp
+
+# Model weights / embeddings (too large for git)
+*.bin
+*.pt
+*.ckpt
+
+# Data files (corpus too large)
+*.json
+!sample_findings.json
+
+# DB dumps
+*.sql
+*.dump
+
+
+# Scratch and test files
+test.py
+zeethree.py
+
+# Data pipeline scripts (internal tooling)
+dataretlated/
+
+docker-compose.yml
+
+prompts/
