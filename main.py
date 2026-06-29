@@ -1,4 +1,5 @@
 import os
+import json
 from dotenv import load_dotenv
 from domain.arbiter import Arbiter
 from langchain_openai import ChatOpenAI
@@ -6,18 +7,20 @@ from Infrastructure.postgres import retrieve
 from domain.propertygenerator import PropertyGenerator
 from domain.cegis import CEGIS
 from domain.state import GraphState
-from langchain_core.tools import tool
+from domain.slither_runner import run_slither
 import subprocess
 import tempfile
 
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
+
 load_dotenv()
 
-# @tool
 def run_z3(z3_code: str) -> dict:
-    """Executes Z3 Python code and returns the result."""
     with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
         f.write(z3_code)
         temp_path = f.name
+
     try:
         result = subprocess.run(
             ["python", temp_path],
@@ -44,16 +47,35 @@ def run_z3(z3_code: str) -> dict:
                 "error": result.stderr,
                 "z3_code": z3_code
             }
+
+    except subprocess.TimeoutExpired:
+        return {
+            "status": "error",
+            "output": None,
+            "error": "Z3 timeout — model too complex, simplify bounds",
+            "z3_code": z3_code
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "output": None,
+            "error": str(e),
+            "z3_code": z3_code
+        }
+
     finally:
         os.unlink(temp_path)
 
+
 # 1. Load contract
-with open("RugToken.sol", "r") as f:
+contract_path = "LendingPool.sol"
+with open(contract_path, "r") as f:
     contract_code = f.read()
 
 # 2. Initialize state
 state: GraphState = {
-    "user_intent_raw": "Verify owner cannot mint unlimited tokens or drain all funds",
+    "user_intent_raw": "Verify that interest rate cannot be set by unauthorized users, liquidation cannot be manipulated via oracle price, and share ratio cannot be inflated by first depositor",
     "user_contract": contract_code,
     "mode": "",
     "intent": "",
@@ -61,6 +83,7 @@ state: GraphState = {
     "findings": [],
     "z3_code": "",
     "z3_result": None,
+    "slither_result": None,
     "status": "running",
     "bug_report": None,
     "iterations": 0
@@ -83,17 +106,21 @@ state["mode"] = resultsfromExpansion["mode"]
 state["intent"] = resultsfromExpansion["intent"]
 state["queries"] = resultsfromExpansion["queries"]
 
-# 4. RAG + PropertyGenerator + CEGIS (z3 mode only)
+llm_pro = ChatOpenAI(
+    model="deepseek-v4-pro",
+    openai_api_key=os.environ.get("DEEPSEEK_API_KEY"),
+    openai_api_base="https://api.deepseek.com",
+    extra_body={"thinking": {"type": "enabled", "budget_tokens": 16000}}
+)
+
 if state["mode"] == "z3":
 
-    # RAG
     resultsFromRAG = retrieve(state["queries"])
     state["findings"] = resultsFromRAG
     print("\n=== RAG OUTPUT ===")
     for r in resultsFromRAG:
         print(r["title_normalized"], "|", r["vuln_class"], "|", r["rerank_score"])
 
-    # PropertyGenerator
     generator = PropertyGenerator(agent=llm_flash)
     generator.build_prompt(resultsfromExpansion, contract_code, resultsFromRAG)
     z3_code = generator.propertyGeneration()
@@ -101,50 +128,46 @@ if state["mode"] == "z3":
     print("\n=== GENERATED Z3 CODE ===")
     print(z3_code)
 
-    # CEGIS
-    llm_pro = ChatOpenAI(
-        model="deepseek-v4-pro",
-        openai_api_key=os.environ.get("DEEPSEEK_API_KEY"),
-        openai_api_base="https://api.deepseek.com",
-        extra_body={"thinking": {"type": "enabled", "budget_tokens": 16000}}
-    ).bind_tools([run_z3])
+    cegis = CEGIS(agent=llm_pro, run_z3_tool=run_z3)
+    state = cegis.cegis_loop(state)
+
+elif state["mode"] == "slither":
+
+    print("\n=== RUNNING SLITHER ===")
+    slither_result = run_slither(contract_path)
+    state["slither_result"] = slither_result
+    print(f"Findings: {slither_result['findings_count']}")
 
     cegis = CEGIS(agent=llm_pro, run_z3_tool=run_z3)
     state = cegis.cegis_loop(state)
 
+elif state["mode"] == "both":
+
+    print("\n=== RUNNING SLITHER ===")
+    slither_result = run_slither(contract_path)
+    state["slither_result"] = slither_result
+    print(f"Slither findings: {slither_result['findings_count']}")
+
+    resultsFromRAG = retrieve(state["queries"])
+    state["findings"] = resultsFromRAG
+    print("\n=== RAG OUTPUT ===")
+    for r in resultsFromRAG:
+        print(r["title_normalized"], "|", r["vuln_class"], "|", r["rerank_score"])
+
+    generator = PropertyGenerator(agent=llm_flash)
+    generator.build_prompt(resultsfromExpansion, contract_code, resultsFromRAG)
+    z3_code = generator.propertyGeneration()
+    state["z3_code"] = z3_code
+    print("\n=== GENERATED Z3 CODE ===")
+    print(z3_code)
+
+    cegis = CEGIS(agent=llm_pro, run_z3_tool=run_z3)
+    state = cegis.cegis_loop(state)
+
+elif state["mode"] == "standard":
+    print("Standard mode — no formal verification needed")
+
+if state["mode"] != "standard":
     print("\n=== FINAL STATUS ===")
     print("Status:", state["status"])
     print("Bug Report:", state["bug_report"])
-
-elif state["mode"] == "standard":
-    # conversational mode, skip RAG and Z3
-    print("Standard mode — no formal verification needed")
-
-
-
-
-
-# from typing import TypedDict, Optional
-
-
-# class GraphState(TypedDict):
-#     # Input
-#     user_intent_raw: str
-#     user_contract: str
-    
-#     # Arbiter output
-#     mode: str
-#     intent: str
-#     queries: list[str]
-    
-#     # RAG output
-#     findings: list[dict]
-    
-#     # PropertyGenerator output
-#     z3_code: str
-    
-#     # CEGIS output
-#     z3_result: Optional[dict]
-#     status: str        # "running" | "verified" | "bug_found" | "needs_review"
-#     bug_report: Optional[str]
-#     iterations: int

@@ -13,3 +13,4 @@ class GraphState(TypedDict):
     status: str
     bug_report: Optional[str]
     iterations: int
+    slither_result: Optional[dict]
