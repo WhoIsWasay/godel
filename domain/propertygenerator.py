@@ -20,7 +20,30 @@ class PropertyGenerator:
                 lines.append(f"    Code: {f['code_snippet'][:200].strip()}")
                 lines.append("")
         return "\n".join(lines)
+    
+    
+    
+    def propertyGeneration(self) -> str:
+        response = self.agent.invoke([
+        SystemMessage(content=self.SYSTEM_PROMPT),
+        HumanMessage(content=self.prompt),
+    ])
+        raw = response.content
 
+        if "```python" in raw:
+            code = raw.split("```python")[1].split("```")[0].strip()
+        elif "```" in raw:
+        # fence present but no language tag — take the last fenced block
+        # (scratchpad, if fenced, would be the first; code should be the last)
+            parts = raw.split("```")
+            code = parts[-2].strip() if len(parts) >= 3 else raw.strip()
+        elif "from z3 import *" in raw:
+        # no fence at all — fall back to slicing from the known code start marker
+            code = "from z3 import *" + raw.split("from z3 import *", 1)[1]
+        else:
+            code = raw.strip()
+
+        return code
 
     def propertyGeneration(self) -> str:
         response = self.agent.invoke([

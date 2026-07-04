@@ -37,24 +37,35 @@ Thumbs.db
 *.pt
 *.ckpt
 
-# Data files (corpus too large)
-*.json
-!sample_findings.json
+# Foundry build artifacts / dependencies (restored via forge install / .gitmodules)
+lib/
+cache/
+out/
+broadcast/
+
+# Pipeline-generated output (findings, reports, proofs, fixes, submissions)
+output/
+lendingPool/
+*.xml
+
+# Data pipeline scripts / corpus (internal tooling, too large for git)
+dataretlated/
+dataretlated/*.json
+!dataretlated/sample_findings.json
 
 # DB dumps
 *.sql
 *.dump
 
-
 # Scratch and test files
 test.py
 zeethree.py
 
-# Data pipeline scripts (internal tooling)
-dataretlated/
-
+# Docker / infra config with local secrets
 docker-compose.yml
 
-prompts/
+# Contract scratch folders
 testOfCode/
-solContracts
+solContracts/
+solCon/
+

@@ -582,3 +582,6 @@ def main():
             print(f"  Verification Report saved: {report_path}")
 
     print("\n" + "="*50 + "\n=== SYSTEM PIPELINE EXECUTION COMPLETE ===\n" + "="*50)
+
+if __name__ == "__main__":
+    main()
