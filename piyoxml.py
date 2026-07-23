@@ -11,23 +11,16 @@ import textwrap
 def create_index_mask(text):
     """
     Creates a 'ghost copy' of the file where comments and strings are replaced 
-    by blank spaces. This guarantees regex never triggers on keywords hidden inside them,
-    while perfectly maintaining character indices for extraction later.
+    by blank spaces. This unified regex processes left-to-right, ensuring that 
+    quotes inside comments or slashes inside strings do not corrupt the parser.
     """
+    # Matches strings OR block comments OR line comments in one pass
+    pattern = r'("(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\')|(/\*[\s\S]*?\*/)|(//.*)'
+    
     def replacer(match):
         return ' ' * len(match.group(0))
     
-    # 1. Mask strings (handles escaped quotes safely)
-    masked = re.sub(r'"(?:\\.|[^"\\])*"', replacer, text)
-    masked = re.sub(r"'(?:\\.|[^'\\])*'", replacer, masked)
-    
-    # 2. Mask block comments /* ... */
-    masked = re.sub(r'/\*[\s\S]*?\*/', replacer, masked)
-    
-    # 3. Mask single line comments // ...
-    masked = re.sub(r'//.*', replacer, masked)
-    
-    return masked
+    return re.sub(pattern, replacer, text)
 
 def parse_solidity_to_xml(file_path) -> str:
     if not os.path.exists(file_path):
@@ -55,7 +48,6 @@ def parse_solidity_to_xml(file_path) -> str:
         xml_output.append("    </environment_setup>\n")
 
     # Extract Top-Level Containers (contract, interface, library)
-    # The mask guarantees we don't accidentally match words inside comments
     block_pattern = r'\b(contract|interface|library)\s+([a-zA-Z0-9_]+)'
     
     search_idx = 0
@@ -100,8 +92,6 @@ def parse_solidity_to_xml(file_path) -> str:
     xml_output.append('</source_file>')
     final_xml = "\n".join(xml_output)
 
-    print("\n---   BULLETPROOF SEMANTIC XML FOR AI  ---\n")
-    print(final_xml)
     return final_xml
 
 def process_inner_block(b_type, b_name, inner_start, inner_end, original, masked, indent="    "):
@@ -148,7 +138,6 @@ def process_inner_block(b_type, b_name, inner_start, inner_end, original, masked
         if f_end == -1: f_end = inner_end
             
         # Walk BACKWARDS through blank spaces in the mask to capture NatSpec comments.
-        # This ties `/// @notice` safely to the function instead of stranding it in state variables.
         real_start = f_start
         for i in range(f_start - 1, inner_start - 1, -1):
             if masked[i].strip() == '':
@@ -215,3 +204,5 @@ def process_inner_block(b_type, b_name, inner_start, inner_end, original, masked
 
 if __name__ == "__main__":
     parse_solidity_to_xml(FILE_TO_PARSE)
+    
+    # pass
