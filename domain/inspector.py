@@ -4,25 +4,30 @@ import re
 from difflib import SequenceMatcher
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from domain.config import PROMPTS_DIR
+from domain.llm_utils import call_with_retry
+
 
 class Inspector:
 
     def __init__(self, isolator_llm, compositor_llm):
-        with open("prompts/isolator.txt", "r", encoding="utf-8") as f:
+        with open(PROMPTS_DIR / "isolator.txt", "r", encoding="utf-8") as f:
             self.isolator_prompt = f.read()
 
-        with open("prompts/compositor.txt", "r", encoding="utf-8") as f:
+        with open(PROMPTS_DIR / "compositor.txt", "r", encoding="utf-8") as f:
             self.compositor_prompt = f.read()
 
         self.isolator_agent = isolator_llm
         self.compositor_agent = compositor_llm
 
     def _invoke(self, agent, system_prompt: str, user_input: str) -> str:
-        response = agent.invoke(
-            [
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=user_input),
-            ]
+        response = call_with_retry(
+            lambda: agent.invoke(
+                [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=user_input),
+                ]
+            )
         )
         return response.content.strip()
 

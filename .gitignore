@@ -48,6 +48,9 @@ output/
 lendingPool/
 *.xml
 
+# Gatekeeper materializes audited contracts here at runtime (scratch)
+src/
+
 # Data pipeline scripts / corpus (internal tooling, too large for git)
 dataretlated/
 dataretlated/*.json

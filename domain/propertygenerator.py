@@ -1,10 +1,13 @@
 import json
 from langchain_core.messages import SystemMessage, HumanMessage
 
+from domain.config import PROMPTS_DIR
+from domain.llm_utils import call_with_retry
+
 
 class PropertyGenerator:
 
-    with open("prompts/property_generator_prompt.txt", "r") as f:
+    with open(PROMPTS_DIR / "property_generator_prompt.txt", "r") as f:
         SYSTEM_PROMPT = f.read()
 
     def __init__(self, agent):
@@ -24,10 +27,12 @@ class PropertyGenerator:
     
     
     def propertyGeneration(self) -> str:
-        response = self.agent.invoke([
-        SystemMessage(content=self.SYSTEM_PROMPT),
-        HumanMessage(content=self.prompt),
-    ])
+        response = call_with_retry(
+            lambda: self.agent.invoke([
+                SystemMessage(content=self.SYSTEM_PROMPT),
+                HumanMessage(content=self.prompt),
+            ])
+        )
         raw = response.content
 
         if "```python" in raw:
@@ -45,16 +50,6 @@ class PropertyGenerator:
 
         return code
 
-    def propertyGeneration(self) -> str:
-        response = self.agent.invoke([
-        SystemMessage(content=self.SYSTEM_PROMPT),  # your system prompt constant
-        HumanMessage(content=self.prompt),
-    ])
-        raw = response.content
-    # strip markdown fences if present
-        if "```python" in raw:
-            raw = raw.split("```python")[1].split("```")[0].strip()
-        return raw
 
 
     def build_prompt(self, expansion: dict, contract: str, findings: list[dict]) -> None:

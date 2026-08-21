@@ -1,6 +1,7 @@
 import os
 from langchain_core.prompts import ChatPromptTemplate
 from domain.extractor import OutputExtractor
+from domain.llm_utils import call_with_retry
 # <law id="1" title="DYNAMIC IMPORT PROTOCOL">
 #             You must import the target contract under test using the exact filename provided by the system context. 
 #             You MUST strictly use this exact format: import "src/{contract_filename}";
@@ -101,7 +102,7 @@ Please read the target contract source meticulously, parse out its true interfac
             extracted_facts=facts
         )
 
-        response = self.llm.invoke(prompt)
+        response = call_with_retry(lambda: self.llm.invoke(prompt))
         content = response.content.strip()
 
         return self._clean_markdown(content)
@@ -119,7 +120,7 @@ COMPILER ERROR:
 {error_log}
 
 Review the original target contract interface, correct the syntax/arguments according to the exact error, and return ONLY the corrected raw Solidity code inside markdown fences."""
-        response = self.llm.invoke(feedback_prompt)
+        response = call_with_retry(lambda: self.llm.invoke(feedback_prompt))
         return self._clean_markdown(response.content.strip())
 
     def _clean_markdown(self, content: str) -> str:

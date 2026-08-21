@@ -1,0 +1,104 @@
+name: Gödel Audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      contract_folder:
+        description: "Path to the contract folder to audit (e.g. CollateralizeDebtPosition)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Resolve contracts folder
+        id: folder
+        shell: bash
+        run: |
+          FOLDER="${{ github.event.inputs.contract_folder }}"
+          if [ -z "$FOLDER" ]; then
+            FOLDER="${GODEL_CONTRACTS_FOLDER:-CollateralizeDebtPosition}"
+          fi
+          echo "path=$FOLDER" >> "$GITHUB_OUTPUT"
+          echo "Auditing contract folder: $FOLDER"
+        env:
+          GODEL_CONTRACTS_FOLDER: ${{ vars.GODEL_CONTRACTS_FOLDER }}
+
+      - name: Run Gödel pipeline
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          GODEL_CONTRACTS_FOLDER: ${{ steps.folder.outputs.path }}
+        run: python main.py --contracts "$GODEL_CONTRACTS_FOLDER"
+
+      - name: Render reports
+        run: python render.py
+
+      - name: Count findings
+        id: summary
+        shell: bash
+        run: |
+          COUNT=$(find output/submissions -name finding.json 2>/dev/null | wc -l | tr -d ' ')
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Verified findings: $COUNT"
+
+      - name: Upload findings artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: godel-findings
+          path: |
+            output/submissions/
+            output/rendered/
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --body "Godel found **${{ steps.summary.outputs.count }}** verified finding(s). [View full report](https://github.com/WhoIsWasay/godel-audit-results) for details."
+
+      - name: Push results to godel-audit-results
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          TOKEN: ${{ secrets.GODEL_RESULTS_TOKEN }}
+        shell: bash
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "GODEL_RESULTS_TOKEN not configured; skipping push to results repo."
+            exit 0
+          fi
+          git config --global user.name "godel-bot"
+          git config --global user.email "godel-bot@users.noreply.github.com"
+          rm -rf results-repo
+          git clone "https://x-access-token:${TOKEN}@github.com/WhoIsWasay/godel-audit-results.git" results-repo
+          mkdir -p results-repo/rendered
+          cp -r output/rendered/* results-repo/rendered/ 2>/dev/null || true
+          cd results-repo
+          git add -A
+          git commit -m "Audit run: $(date -u +%Y-%m-%dT%H:%M:%SZ)" || echo "nothing to commit"
+          git push

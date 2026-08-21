@@ -43,14 +43,13 @@ class SubmissionFormatter:
         Compiles all runtime data vectors into a single, comprehensive markdown string.
         """
         func_name = finding.get("target_function", "unknown")
-        severity = finding.get("severity_guess", "medium").upper()
         
-        # Safely extract and truncate the intent description into a clean title line
+        # # Safely extract and truncate the intent description into a clean title line
         raw_intent = finding.get("intent", "Logic Flaw Detected")
         words = raw_intent.split()[:8]
         title_summary = " ".join(words).replace('"', '').replace("'", "") + "..."
 
-        # Determine target file mapping based on the solver mode used
+        # # Determine target file mapping based on the solver mode used
         safe_func = re.sub(r'[^a-zA-Z0-9_]', '', func_name)
         if state.get("mode") == "slither":
             proof_file = f"{stem}_{safe_func}_{finding_idx}_slither.json"
@@ -62,10 +61,10 @@ class SubmissionFormatter:
 
         # Interpolate variables safely into the string layout without formatting escapes
         compiled_markdown = self.template.format(
-            severity_label=severity,
-            vulnerability_title=title_summary,
-            function_name=func_name,
-            intent_description=raw_intent,
+            severity_label=finding.get("severity_guess", "medium").upper(),
+            vulnerability_title= title_summary,
+            function_name= func_name,
+            intent_description= raw_intent,
             invariant_constraint=finding.get("constraint", "Implicit Invariant Exception"),
             vulnerable_code_snippet=finding.get("relevant_code", ""),
             solver_trace_log=solver_trace_log,
@@ -80,3 +79,6 @@ class SubmissionFormatter:
     def compile_report(self, *args, **kwargs):
         """Fallback method alias mapping directly to compile_bounty_report."""
         return self.compile_bounty_report(*args, **kwargs)
+    
+    
+    

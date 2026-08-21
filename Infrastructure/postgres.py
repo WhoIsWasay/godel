@@ -1,10 +1,20 @@
 import httpx
 import psycopg2
 import psycopg2.extras
-from sentence_transformers import CrossEncoder
 import os
+import time
+import logging
 from dotenv import load_dotenv
+
 load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+# Prefixed print so RAG diagnostics are impossible to miss in terminal logs.
+def _raglog(msg: str):
+    line = f"[RAG] {msg}"
+    print(line, flush=True)
+    logger.info(line)
 
 
 OLLAMA_URL  = "http://localhost:11434/api/embed"
@@ -20,15 +30,41 @@ DB_CONFIG = {
     "password": os.environ.get("DB_PASSWORD"),
 }
 
-cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+# ---------------------------------------------------------------------------
+# Cross-encoder is loaded lazily (first call only) so importing this module
+# stays cheap for the pipeline when RAG is not in the hot path. A lock guards
+# the lazy init because the specifier node runs concurrently (ThreadPool).
+# ---------------------------------------------------------------------------
+import threading
+_cross_encoder = None
+_cross_encoder_loaded_at = None
+_cross_encoder_lock = threading.Lock()
+
+
+def _get_cross_encoder():
+    global _cross_encoder, _cross_encoder_loaded_at
+    if _cross_encoder is None:
+        with _cross_encoder_lock:
+            if _cross_encoder is None:  # double-checked under lock
+                t0 = time.time()
+                _raglog("Loading cross-encoder reranker (ms-marco-MiniLM-L-6-v2)...")
+                from sentence_transformers import CrossEncoder
+                _cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+                _cross_encoder_loaded_at = time.time() - t0
+                _raglog(f"Cross-encoder loaded in {_cross_encoder_loaded_at:.1f}s")
+    return _cross_encoder
 
 
 def embed(text: str) -> list[float]:
+    t0 = time.time()
     response = httpx.post(OLLAMA_URL, json={
         "model": EMBED_MODEL,
         "input": text,
-    }, timeout=60)
-    return response.json()["embeddings"][0][:2000]  # truncate to match index
+    }, timeout=180)  # 180s: first call loads the 8b model into VRAM
+    vec = response.json()["embeddings"][0][:2000]  # truncate to match index
+    _raglog(f"embed() -> dim={len(vec)} in {time.time()-t0:.1f}s")
+    return vec
 
 
 def vector_search(conn, embedding: list[float], top_k: int = 10) -> list[dict]:
@@ -50,36 +86,62 @@ def vector_search(conn, embedding: list[float], top_k: int = 10) -> list[dict]:
             ORDER BY embedding <=> %s::vector
             LIMIT %s
         """, (vec_str, vec_str, top_k))
-        return [dict(row) for row in cur.fetchall()]
+        rows = [dict(row) for row in cur.fetchall()]
+
+    _raglog(f"vector_search() -> {len(rows)} rows:")
+    for r in rows:
+        _raglog(f"    sim={float(r['score']):.4f}  [{r.get('severity')}]  "
+                f"{str(r.get('title_normalized'))[:70]}  class={r.get('vuln_class')}")
+    return rows
 
 
 def retrieve(queries: list[str], top_k_per_query: int = 10, final_top_k: int = 5) -> list[dict]:
+    """Multi-query vector search + cross-encoder rerank with full terminal logging."""
+    t0_total = time.time()
+    _raglog(f"===== RETRIEVE START =====")
+    _raglog(f"Queries ({len(queries)}):")
+    for i, q in enumerate(queries, 1):
+        _raglog(f"    Q{i}: {q[:150]}")
+
     conn = psycopg2.connect(**DB_CONFIG)
 
     # 1. Embed + vector search each query
     candidates = {}
-    for query in queries:
+    for qi, query in enumerate(queries, 1):
+        t0 = time.time()
         embedding = embed(query)
+        _raglog(f"Q{qi} embedded in {time.time()-t0:.1f}s — vector search...")
         results = vector_search(conn, embedding, top_k=top_k_per_query)
+        new = 0
         for row in results:
             uid = row["id"]
             if uid not in candidates:
                 candidates[uid] = row  # dedup on uid, first occurrence wins
+                new += 1
+        _raglog(f"Q{qi} added {new} new candidates (total unique: {len(candidates)})")
 
     conn.close()
 
     # 2. Cross-encoder rerank
+    encoder = _get_cross_encoder()
     candidate_list = list(candidates.values())
-    
-    # Use the original query joined as context for reranking
+    _raglog(f"Candidates before rerank: {len(candidate_list)}")
+
     combined_query = " ".join(queries)
     pairs = [(combined_query, row["embed_text"] or row["description"] or "") for row in candidate_list]
-    
-    scores = cross_encoder.predict(pairs)
+    t0 = time.time()
+    scores = encoder.predict(pairs)
+    _raglog(f"Rerank scored {len(pairs)} pairs in {time.time()-t0:.1f}s")
 
     for i, row in enumerate(candidate_list):
         row["rerank_score"] = float(scores[i])
 
     reranked = sorted(candidate_list, key=lambda x: x["rerank_score"], reverse=True)
+    final = reranked[:final_top_k]
 
-    return reranked[:final_top_k]
+    _raglog(f"----- FINAL TOP-{final_top_k} (reranked) -----")
+    for i, r in enumerate(final, 1):
+        _raglog(f"  #{i} rerank={r['rerank_score']:.4f} sim={float(r.get('score', 0)):.4f} "
+                f"[{r.get('severity')}] {str(r.get('title_normalized'))[:70]} class={r.get('vuln_class')}")
+    _raglog(f"RETRIEVE total time: {time.time()-t0_total:.1f}s")
+    return final

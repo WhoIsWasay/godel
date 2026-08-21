@@ -1,7 +1,10 @@
 import os
 import re
+import logging
 from string import Template
 from langchain_openai import ChatOpenAI
+
+logger = logging.getLogger(__name__)
 
 
 class FixerAgent:
@@ -27,13 +30,13 @@ class FixerAgent:
             with open(self._PROMPT_PATH, "r", encoding="utf-8") as f:
                 content = f.read()
             if not content.strip():
-                print(f"[FixerAgent] Warning: prompt template at {self._PROMPT_PATH} is empty.")
+                logger.warning("[FixerAgent] prompt template at %s is empty.", self._PROMPT_PATH)
             return content
         except FileNotFoundError:
-            print(f"[FixerAgent] Warning: prompt template not found at {self._PROMPT_PATH}.")
+            logger.warning("[FixerAgent] prompt template not found at %s.", self._PROMPT_PATH)
             return ""
         except OSError as e:
-            print(f"[FixerAgent] Warning: could not read prompt template ({e}).")
+            logger.warning("[FixerAgent] could not read prompt template (%s).", e)
             return ""
 
     def generate_remediation(self, finding: dict, state: dict) -> str:

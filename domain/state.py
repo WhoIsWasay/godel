@@ -51,3 +51,17 @@ class GraphState(TypedDict):
     # ==========================================
     # Prevents infinite CEGIS or Supervisor hallucination loops
     iterations: int
+    
+    # Number of times the Supervisor node has run (bounds hunter/specifier loops)
+    supervisor_runs: int
+    
+    # Number of times the Executor node has run (bounds the Z3-fix loop)
+    executor_runs: int
+    
+    # RAG retrieval diagnostics (scores + P@K) captured by the specifier node
+    rag_diagnostics: Optional[dict]
+    
+    
+    poc_test_code : str
+    forge_output : str
+    qc_status : str
