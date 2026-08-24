@@ -63,13 +63,16 @@ dataretlated/*.json
 # Scratch and test files
 test.py
 zeethree.py
+tmp_prop_check.py
+index.html
 
 # Docker / infra config with local secrets
 docker-compose.yml
 
 # Contract scratch folders
-testOfCode/
 solContracts/
 solCon/
 
+# Private benchmark corpus + sample fixtures (personal data, stays local)
 TestsDone/
+testOfCode/fixtures/

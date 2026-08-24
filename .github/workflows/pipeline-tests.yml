@@ -1,0 +1,52 @@
+﻿name: Pipeline Tests
+
+# LLM-free regression net: static analyzer, semantic encoder, invariant mode,
+# routing/verdict logic, Z3 sentinel matrix, and mocked Gatekeeper classification.
+# Runs on every push/PR without any secrets.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  deterministic-tests:
+    runs-on: ubuntu-latest
+    env:
+      # pipeline.py builds ChatOpenAI clients at import time; no calls are made
+      # by these tests, a placeholder key just keeps construction happy.
+      DEEPSEEK_API_KEY: "ci-placeholder-not-used"
+      GODEL_DRY_RUN: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Phase 1 â€” abstracter suite
+        run: python -X utf8 testOfCode/test_abstracter.py
+
+      - name: Phase 2 â€” semantics + CEGIS suite
+        run: python -X utf8 testOfCode/test_phase2.py
+
+      - name: Phase 3 â€” invariant-mode suite
+        run: python -X utf8 testOfCode/test_phase3.py
+
+      - name: Phase 4 â€” routing / verdict / Z3 / Gatekeeper matrices
+        run: python -X utf8 testOfCode/test_phase4.py
+
+      # Contract-free e2e: synthetic contract generated at runtime, LLMs mocked.
+      # (Sample .sol fixtures are intentionally NOT committed to the repo.)
+      - name: Dry-run plumbing e2e (contract-free)
+        run: python -X utf8 testOfCode/test_plumbing.py
