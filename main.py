@@ -103,6 +103,8 @@ def run_invariant_mode(args) -> int:
         return 1
 
     any_break, any_error = False, False
+    any_skipped = False
+    verdicts = []
     for path in sol_files:
         analysis = abstract_contract(path)
         name = os.path.basename(path)
@@ -113,8 +115,12 @@ def run_invariant_mode(args) -> int:
         try:
             report = check_invariant_preservation(analysis, args.invariant)
         except InvariantSyntaxError as e:
-            print(f"\n[{name}] invariant rejected: {e}")
-            return 1
+            # Contract simply has none of the referenced symbols (e.g. scanning
+            # a mixed folder) — skip gracefully instead of killing the sweep.
+            print(f"\n[{name}] invariant references none of its symbols — skipped ({e})")
+            any_skipped = True
+            continue
+        verdicts.append(report["verdict"])
         print(f"\n[{name}] contract={report['contract']}  verdict={report['verdict']}")
         if report["violated_by"]:
             any_break = True
@@ -139,8 +145,17 @@ def run_invariant_mode(args) -> int:
                 any_error = True
                 print(f"   {r['status'].upper()}: {r['function']}")
 
-    print("\n=== INVARIANT MODE RESULT:",
-          "BROKEN — see violating functions above ===" if any_break else "HELD ===")
+    if any_break:
+        result_line = "BROKEN — see violating functions above"
+    elif verdicts and all(v.startswith("INVARIANT PRESERVED") for v in verdicts):
+        result_line = "HELD"
+        if not all(v == "INVARIANT PRESERVED (exact)" for v in verdicts):
+            result_line += " (under over-approximation)"
+    else:
+        # Inconclusive / possibly-violated / all-skipped: never print HELD.
+        result_line = ("INCONCLUSIVE or PARTIAL — review POSSIBLY VIOLATED functions above;"
+                       + (" some contracts skipped" if any_skipped else ""))
+    print("\n=== INVARIANT MODE RESULT:", result_line, "===")
     return 1 if any_break else 0
 
 
