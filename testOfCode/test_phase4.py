@@ -244,5 +244,17 @@ with patch.object(subprocess, "run", return_value=fake_run(1, "", COMPILE_ERR)):
     st, _ = gk.execute_qc_validation("// json-mode compile error", max_retries=1)
     check("JSON-mode compile failure still -> compile_failed", st == "compile_failed")
 
+# ============================================================ isolator routing
+print("== T6: Isolator model routing ==")
+import domain.pipeline as pl  # noqa: E402
+
+_default_model = getattr(pl.llm_isolator, "model_name",
+                         getattr(pl.llm_isolator, "model", ""))
+check("unset flag -> isolator falls back to reasoning model", _default_model == "deepseek-v4-pro")
+check("compositor always uses reasoning model",
+      getattr(pl.llm_pro, "model_name", getattr(pl.llm_pro, "model", "")) == "deepseek-v4-pro")
+check("flag propagates to Inspector.isolator_agent",
+      pl.inspector.isolator_agent is pl.llm_isolator)
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

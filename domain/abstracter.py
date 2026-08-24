@@ -401,6 +401,10 @@ def abstract_contract(sol_path: str, use_cache: bool = True) -> dict | None:
                 for f in c.functions:
                     if f.is_constructor or not f.entry_point:
                         continue
+                    # Synthetic Slither functions (constant-variable init,
+                    # etc.) are IR artifacts, not callable entrypoints.
+                    if f.full_name.startswith("slitherConstructor"):
+                        continue
                     functions[f.full_name] = _extract_function_facts(f)
 
             if contract_name is None:

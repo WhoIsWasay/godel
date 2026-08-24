@@ -104,5 +104,20 @@ r6 = check_invariant_preservation(vault, "total@new == bal[S]@new + bal[X]@new")
 check("unknown-slot invariant degrades safely",
       r6["verdict"] in ("INCONCLUSIVE", "INVARIANT BROKEN"))
 
+print("== T7: vacuity detection — unsatisfiable Inv(pre) is NOT a proof ==")
+# deposit requires amount > 0, so 'amount < 0 and total >= 0' can never hold
+# in the pre-state: any UNSAT here must be labeled vacuously_preserved.
+r7 = check_invariant_preservation(vault, "arg_amount < 0 and total@new >= 0")
+statuses = {d["function"]: d["status"] for d in r7["details"]}
+dep_status = statuses.get("deposit(uint256)")
+check("vacuous function labeled vacuously_preserved", dep_status == "vacuously_preserved")
+check("vacuity surfaced in report list",
+      "deposit(uint256)" in r7.get("vacuously_preserved_in", []))
+check("vacuous-only invariant does not claim a real proof",
+      "VACUOUS ONLY" in r7["verdict"] and not r7.get("preserved_in"))
+check("genuine preservation still labeled preserved",
+      check_invariant_preservation(vault, "total@new >= 0")["details"][0]["status"]
+      == "preserved")
+
 print(f"\nRESULT: {PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

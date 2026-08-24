@@ -97,6 +97,12 @@ FORGE_TIMEOUT_SECONDS = _env_float("GODEL_FORGE_TIMEOUT", 45.0)
 LLM_RETRY_ATTEMPTS = _env_int("GODEL_LLM_RETRY_ATTEMPTS", 3)
 LLM_RETRY_BACKOFF  = _env_float("GODEL_LLM_RETRY_BACKOFF", 2.0)
 
+# Isolator pass model override. The Isolator runs 3x per contract and is pure
+# candidate generation (every proposal is machine-verified downstream), so a
+# fast/cheap model is usually sufficient; defaults to the reasoning model when
+# unset. Example: GODEL_ISOLATOR_MODEL=deepseek-v4-flash
+ISOLATOR_MODEL = os.environ.get("GODEL_ISOLATOR_MODEL", "").strip()
+
 
 def is_dry_run() -> bool:
     return os.environ.get("GODEL_DRY_RUN", "0") in ("1", "true", "True")

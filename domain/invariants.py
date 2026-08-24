@@ -93,6 +93,34 @@ def _referenced_keys(invariant: str, union_keys: list[str]) -> list[str]:
     return found
 
 
+def _py_to_z3_bool(expr: str) -> str:
+    """Python's 'and'/'or' cannot combine Z3 BoolRefs (raises
+    'Symbolic expressions cannot be cast to concrete Boolean values' at
+    runtime). Rewrites top-level boolean connectives into And()/Or() calls.
+    Handles flat mixtures; nested-parenthesization precedence beyond that is
+    outside the v1 invariant grammar."""
+    if " or " in expr:
+        parts = [p.strip() for p in expr.split(" or ")]
+        return "Or(" + ", ".join(_py_to_z3_bool(p) for p in parts) + ")"
+    if " and " in expr:
+        parts = [p.strip() for p in expr.split(" and ")]
+        return "And(" + ", ".join(_py_to_z3_bool(p) for p in parts) + ")"
+    return expr
+
+
+def _inv_codes(harness: dict, invariant: str, referenced: list[str]):
+    """Returns (inv_new_code, inv_pre_code) — Z3-python for the invariant over
+    post-state keys and over pre-state keys ('@new' collapsed), respectively.
+    Only referenced keys present in this harness's symbol table are wrapped."""
+    sym_keys = list(harness["symbols"].keys())
+    inv_new_keys = [k for k in referenced if k in sym_keys]
+    inv_new = _wrap_keys(invariant, inv_new_keys)
+    pre_src = invariant.replace("@new", "")
+    pre_keys = sorted({k.replace("@new", "") for k in inv_new_keys}, key=len, reverse=True)
+    inv_pre = _wrap_keys(pre_src, pre_keys)
+    return _py_to_z3_bool(inv_new), _py_to_z3_bool(inv_pre)
+
+
 def _compose_preservation_script(harness: dict, invariant: str,
                                  referenced: list[str],
                                  identity_keys: list[str] = None) -> str:
@@ -103,12 +131,7 @@ def _compose_preservation_script(harness: dict, invariant: str,
     `identity_keys` = referenced '@new' keys this function cannot modify; each
     is pinned new == old, which is semantically exact for untouched storage."""
     sym_keys = list(harness["symbols"].keys())
-    inv_new_keys = [k for k in referenced if k in sym_keys]
-    inv_new = _wrap_keys(invariant, inv_new_keys)
-    # pre-state view: '@new' keys collapse to their pre-key
-    pre_src = invariant.replace("@new", "")
-    pre_keys = sorted({k.replace("@new", "") for k in inv_new_keys}, key=len, reverse=True)
-    inv_pre = _wrap_keys(pre_src, pre_keys)
+    inv_new, inv_pre = _inv_codes(harness, invariant, referenced)
 
     identity_lines = []
     for k in (identity_keys or []):
@@ -126,6 +149,35 @@ def _compose_preservation_script(harness: dict, invariant: str,
         + f"INV_NEW = ({inv_new})\n"
         + "solver.add(INV_PRE)\n"
         + "solver.add(Not(INV_NEW))\n"
+        + "if solver.check() == sat:\n"
+        + "    print(\"BUG FOUND:\", solver.model())\n"
+        + "else:\n"
+        + "    print(\"Property holds\")\n"
+    )
+
+
+def _compose_vacuity_script(harness: dict, inv_pre_code: str,
+                            identity_keys: list[str] = None) -> str:
+    """Probe: is Inv(pre) reachable at all through this function's guards?
+    UNSAT here means every 'preserved' answer for this function is VACUOUS
+    (the antecedent is impossible), which must be reported as such rather
+    than presented as a genuine preservation proof."""
+    sym_keys = list(harness["symbols"].keys())
+    identity_lines = []
+    for k in (identity_keys or []):
+        pre_k = k.replace("@new", "")
+        if k in sym_keys and pre_k in sym_keys:
+            identity_lines.append(f"solver.add(V[{k!r}] == V[{pre_k!r}])")
+
+    return (
+        harness["code"]
+        + "\n\n"
+        + "solver, V = build_model()\n"
+        + "\n".join(identity_lines)
+        + ("\n" if identity_lines else "")
+        + f"solver.add({inv_pre_code})\n"
+        # Sentinels keep their z3_runner meanings: SAT = antecedent reachable
+        # (prints BUG FOUND), UNSAT = antecedent impossible ("Property holds").
         + "if solver.check() == sat:\n"
         + "    print(\"BUG FOUND:\", solver.model())\n"
         + "else:\n"
@@ -188,7 +240,16 @@ def check_function(analysis: dict, function_name: str, invariant: str,
         else:
             out["status"] = "possibly_violated"
     elif result["status"] == "unsat":
-        out["status"] = "preserved"
+        # UNSAT preservation can be genuine OR vacuous (Inv(pre) unreachable).
+        # Probe the antecedent alone; never sell a vacuous proof as real.
+        _, inv_pre = _inv_codes(harness, invariant, referenced)
+        vac = run_z3(_compose_vacuity_script(harness, inv_pre, identity_keys))
+        if vac.get("status") == "unsat":
+            out["status"] = "vacuously_preserved"
+            out["vacuity_reason"] = ("Inv(pre) is unsatisfiable through this "
+                                     "function's guards — nothing was proven")
+        else:
+            out["status"] = "preserved"
     else:
         out["status"] = result["status"]  # error / inconclusive
         out["error"] = result.get("error")
@@ -222,6 +283,7 @@ def check_invariant_preservation(analysis: dict, invariant: str,
                for fn in (functions or all_fns)]
     violated = [r for r in results if r["status"] == "violated"]
     preserved = [r for r in results if r["status"] == "preserved"]
+    vacuous = [r for r in results if r["status"] == "vacuously_preserved"]
     inconclusive = [r for r in results
                     if r["status"] in ("possibly_violated", "not_modeled",
                                        "error", "inconclusive")]
@@ -230,10 +292,17 @@ def check_invariant_preservation(analysis: dict, invariant: str,
         verdict = "INVARIANT BROKEN"
     elif inconclusive:
         verdict = "INCONCLUSIVE"
-    else:
+    elif preserved:
         exact = all(r.get("quality") == "FULL" for r in preserved)
         verdict = ("INVARIANT PRESERVED (exact)" if exact
                    else "INVARIANT PRESERVED (under over-approximation)")
+        # Vacuity never upgrades a verdict — it is surfaced as a caveat list.
+        if vacuous:
+            verdict += f" — {len(vacuous)} function(s) vacuously preserved"
+    else:
+        # Only vacuous (and/or read-only) results: NOTHING was actually proven.
+        verdict = ("VACUOUS ONLY — no function's pre-state satisfies the "
+                   "invariant; no preservation was proven")
 
     return {
         "contract": analysis.get("contract"),
@@ -243,6 +312,7 @@ def check_invariant_preservation(analysis: dict, invariant: str,
         "possibly_violated_by": [r["function"] for r in results
                                  if r["status"] == "possibly_violated"],
         "preserved_in": [r["function"] for r in preserved],
+        "vacuously_preserved_in": [r["function"] for r in vacuous],
         "errors": inconclusive,
         "details": results,
     }

@@ -32,6 +32,8 @@ if HAS_FIXTURES:
               set(f["state_writes"]) == {"totalCollateral", "totalSupply", "vaultShares"})
         check("external call transferFrom captured",
               any("transferFrom" in c for c in f["external_calls"]))
+    check("no slitherConstructor synthetics in functions",
+          not any(fn.startswith("slitherConstructor") for fn in a["functions"]))
 else:
     check("T1 SKIPPED (fixtures not present — contract-free CI mode)", True)
 

@@ -139,6 +139,9 @@ def run_invariant_mode(args) -> int:
                       f"the encoder cannot represent)")
             elif r["status"] == "preserved":
                 print(f"   preserved in {r['function']}  [{r.get('quality')}]")
+            elif r["status"] == "vacuously_preserved":
+                print(f"   VACUOUSLY PRESERVED in {r['function']} "
+                      f"(Inv(pre) unreachable — NOT a real proof)")
             elif r["status"] == "preserved_readonly":
                 print(f"   trivially preserved in {r['function']} (read-only w.r.t. invariant)")
             elif r["status"] in ("error", "inconclusive"):

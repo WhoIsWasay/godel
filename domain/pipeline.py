@@ -74,7 +74,23 @@ llm_pro = ChatOpenAI(
     max_retries=3,
 )
 
-inspector = Inspector(llm_pro, llm_pro)
+# Isolator client: overridable to a fast model (GODEL_ISOLATOR_MODEL) since
+# its proposals are machine-verified downstream. Falls back to llm_pro.
+llm_isolator = (
+    ChatOpenAI(
+        model=config.ISOLATOR_MODEL,
+        openai_api_key=os.environ.get("DEEPSEEK_API_KEY"),
+        temperature=0.0,
+        max_tokens=24000,
+        openai_api_base="https://api.deepseek.com",
+        extra_body={"thinking": {"type": "disabled"}},
+        timeout=120,
+        max_retries=3,
+    )
+    if config.ISOLATOR_MODEL else llm_pro
+)
+
+inspector = Inspector(llm_isolator, llm_pro)
 generator = PropertyGenerator(agent=llm_flash)
 property_verifier = PropertyVerifierAgent(agent_llm=llm_pro)
 gatekeeper = FoundryGatekeeper(project_root=str(config.FOUNDRY_ROOT), verifier_agent=property_verifier)
