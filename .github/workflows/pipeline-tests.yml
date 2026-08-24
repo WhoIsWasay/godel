@@ -49,6 +49,9 @@ jobs:
       - name: BitVec-256 wraparound probe
         run: python -X utf8 testOfCode/test_wrap_probe.py
 
+      - name: Invariant-discovery loop (LLM mocked)
+        run: python -X utf8 testOfCode/test_discovery.py
+
       # Contract-free e2e: synthetic contract generated at runtime, LLMs mocked.
       # (Sample .sol fixtures are intentionally NOT committed to the repo.)
       - name: Dry-run plumbing e2e (contract-free)

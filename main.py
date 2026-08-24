@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import shutil
@@ -81,6 +82,85 @@ def _doctor_impl() -> int:
     crit_fail = any(c and s != "OK" for c, _, s, _ in rows)
     print("=== RESULT:", "NOT READY — fix required items (*) ===" if crit_fail else "READY ===")
     return 1 if crit_fail else 0
+
+
+def run_discovery(args) -> int:
+    """Phase C: LLM-proposed invariant discovery, machine-verified by Z3.
+    Proven properties and broken invariants (with counterexamples) land in
+    output/reports/; broken ones additionally emit finding JSON."""
+    from domain.config import CONTRACTS_FOLDER, REPORTS_FOLDER, FINDINGS_FOLDER
+    from domain.abstracter import abstract_contract
+    from domain.discovery import discover_invariants, default_discovery_llm
+    from datetime import datetime
+
+    folder = args.contracts or CONTRACTS_FOLDER
+    if not folder or not os.path.isdir(folder):
+        print(f"Invalid contracts folder for --discover: {folder!r}")
+        return 1
+
+    sol_files = []
+    for root, _, files in os.walk(folder):
+        sol_files.extend(os.path.join(root, f) for f in sorted(files) if f.endswith(".sol"))
+    if not sol_files:
+        print(f"No .sol files found in {folder}")
+        return 1
+
+    llm = default_discovery_llm()
+    totals = {"proven": 0, "broken": 0, "inconclusive": 0, "rejected": 0}
+    for path in sol_files:
+        stem = os.path.splitext(os.path.basename(path))[0]
+        analysis = abstract_contract(path)
+        if analysis is None:
+            print(f"\n[{stem}] static analysis unavailable — skipped (non-fatal)")
+            continue
+        print(f"\n=== DISCOVERY: {stem} (proposing -> proving) ===")
+        result = discover_invariants(analysis, llm)
+        for k in totals:
+            totals[k] += len(result[k])
+
+        for p in result["proven"]:
+            print(f"   PROVEN       {p['invariant']}   [{p['verdict']}]")
+        for b in result["broken"]:
+            print(f"   BROKEN       {b['invariant']}   violated by {b['violated_by']}")
+            for c in b.get("counterexamples", []):
+                vals = ", ".join(f"{k}={v}" for k, v in sorted(c["assignments"].items()))
+                print(f"                    cex in {c['function']}: {vals}")
+        for i in result["inconclusive"]:
+            print(f"   INCONCLUSIVE {i['invariant']}   [{i['verdict']}]")
+        for rj in result["rejected"]:
+            print(f"   rejected     {rj['invariant'][:60]} ({rj['reason'][:50]})")
+
+        out_json = {
+            "contract": result["contract"],
+            "generated": datetime.now().isoformat(timespec="seconds"),
+            **result,
+        }
+        with open(REPORTS_FOLDER / f"{stem}_discovery.json", "w", encoding="utf-8") as fh:
+            json.dump(out_json, fh, indent=2)
+
+        # Broken invariants become finding-shaped artifacts (gatekeeper/PoC
+        # integration point for the graph pipeline).
+        for idx, b in enumerate(result["broken"], 1):
+            finding = {
+                "contract": result["contract"],
+                "function": (b["violated_by"] or ["contract-level"])[0],
+                "severity": "high",
+                "title": f"Invariant broken: {b['invariant']}",
+                "summary": f"Discovered invariant '{b['invariant']}' is violated.",
+                "root_cause": b["invariant"],
+                "invariant": b["invariant"],
+                "counterexamples": b.get("counterexamples", []),
+                "metadata": {"timestamp": datetime.now().isoformat(timespec="seconds"),
+                             "status": "broken_invariant", "source": "discovery"},
+            }
+            with open(FINDINGS_FOLDER / f"{stem}_invfinding_{idx}.json", "w",
+                      encoding="utf-8") as fh:
+                json.dump(finding, fh, indent=2)
+
+    print(f"\n=== DISCOVERY SUMMARY: {totals['proven']} proven | "
+          f"{totals['broken']} broken | {totals['inconclusive']} inconclusive | "
+          f"{totals['rejected']} rejected ===")
+    return 0
 
 
 def run_wrap_probe(args) -> int:
@@ -212,6 +292,8 @@ def main():
                         help="Contract-wide invariant mode: check preservation of EXPR across all public "
                              "functions (deterministic, no LLM). Post-state keys use '@new', e.g. "
                              "\"total@new == bal[S]@new\"")
+    parser.add_argument("--discover", action="store_true",
+                        help="LLM-proposed invariant discovery: proposals are machine-proven/refuted by Z3 across all functions (one fast LLM call per contract)")
     parser.add_argument("--wrap-probe", action="store_true",
                         help="BitVec-256 wraparound triage: flag storage arithmetic that can overflow/underflow "
                              "in a single call (deterministic, conservative — guards not assumed)")
@@ -222,6 +304,9 @@ def main():
 
     if args.wrap_probe:
         return run_wrap_probe(args)
+
+    if args.discover:
+        return run_discovery(args)
 
     if args.invariant:
         return run_invariant_mode(args)
