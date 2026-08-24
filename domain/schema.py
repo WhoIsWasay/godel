@@ -1,7 +1,10 @@
 import json
+import logging
 from datetime import datetime
 
 from domain.extractor import OutputExtractor
+
+logger = logging.getLogger(__name__)
 
 
 # ==========================================
@@ -50,7 +53,7 @@ def build_finding(finding, state, fixed_code, test_suite, forge_output, qc_statu
         "p_at_5": (rag_precisions.get(5) or {}).get("p_at_k"),
     }
 
-    return {
+    result = {
         "contract": state.get("contract_name", "unknown"),
         "function": finding.get("target_function", "unknown"),
         "severity": finding.get("severity_guess", "medium"),
@@ -72,6 +75,13 @@ def build_finding(finding, state, fixed_code, test_suite, forge_output, qc_statu
             "status": qc_status,
         },
     }
+
+    # Schema validation is enforced at construction time (was dead code).
+    errors = validate_finding(result)
+    if errors:
+        logger.warning("[SCHEMA WARNING] Built finding failed validation: %s", errors)
+
+    return result
 
 
 def validate_finding(f: dict) -> list:

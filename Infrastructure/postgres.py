@@ -4,9 +4,11 @@ import psycopg2.extras
 import os
 import time
 import logging
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+# Root-anchored (never CWD-dependent, matches domain/pipeline.py)
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 logger = logging.getLogger(__name__)
 
@@ -58,11 +60,26 @@ def _get_cross_encoder():
 
 def embed(text: str) -> list[float]:
     t0 = time.time()
-    response = httpx.post(OLLAMA_URL, json={
-        "model": EMBED_MODEL,
-        "input": text,
-    }, timeout=180)  # 180s: first call loads the 8b model into VRAM
-    vec = response.json()["embeddings"][0][:2000]  # truncate to match index
+    try:
+        response = httpx.post(OLLAMA_URL, json={
+            "model": EMBED_MODEL,
+            "input": text,
+        }, timeout=180)  # 180s: first call loads the 8b model into VRAM
+        response.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        raise RuntimeError(f"Ollama embed failed with HTTP {e.response.status_code}: "
+                           f"{e.response.text[:300]}") from e
+    except httpx.HTTPError as e:
+        raise RuntimeError(f"Ollama embed request failed: {e}") from e
+
+    payload = response.json()
+    if not isinstance(payload, dict) or not payload.get("embeddings"):
+        # Ollama returns {"error": "..."} payloads on failure — surface them
+        # clearly instead of crashing on KeyError/IndexError.
+        raise RuntimeError(f"Unexpected embed response from Ollama: {str(payload)[:300]}")
+    vec = payload["embeddings"][0][:2000]  # truncate to match index
+    if not vec:
+        raise RuntimeError("Ollama returned an empty embedding vector")
     _raglog(f"embed() -> dim={len(vec)} in {time.time()-t0:.1f}s")
     return vec
 
@@ -104,23 +121,24 @@ def retrieve(queries: list[str], top_k_per_query: int = 10, final_top_k: int = 5
         _raglog(f"    Q{i}: {q[:150]}")
 
     conn = psycopg2.connect(**DB_CONFIG)
-
-    # 1. Embed + vector search each query
-    candidates = {}
-    for qi, query in enumerate(queries, 1):
-        t0 = time.time()
-        embedding = embed(query)
-        _raglog(f"Q{qi} embedded in {time.time()-t0:.1f}s — vector search...")
-        results = vector_search(conn, embedding, top_k=top_k_per_query)
-        new = 0
-        for row in results:
-            uid = row["id"]
-            if uid not in candidates:
-                candidates[uid] = row  # dedup on uid, first occurrence wins
-                new += 1
-        _raglog(f"Q{qi} added {new} new candidates (total unique: {len(candidates)})")
-
-    conn.close()
+    try:
+        # 1. Embed + vector search each query
+        candidates = {}
+        for qi, query in enumerate(queries, 1):
+            t0 = time.time()
+            embedding = embed(query)
+            _raglog(f"Q{qi} embedded in {time.time()-t0:.1f}s — vector search...")
+            results = vector_search(conn, embedding, top_k=top_k_per_query)
+            new = 0
+            for row in results:
+                uid = row["id"]
+                if uid not in candidates:
+                    candidates[uid] = row  # dedup on uid, first occurrence wins
+                    new += 1
+            _raglog(f"Q{qi} added {new} new candidates (total unique: {len(candidates)})")
+    finally:
+        # No leaked connections when the embed/search loop raises.
+        conn.close()
 
     # 2. Cross-encoder rerank
     encoder = _get_cross_encoder()

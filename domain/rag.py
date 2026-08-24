@@ -214,6 +214,18 @@ def retrieve_findings_for_specifier(finding: dict,
         results = retrieve(queries,
                            top_k_per_query=top_k_per_query,
                            final_top_k=final_top_k)
+    except ImportError as e:
+        # Missing dependency (e.g. psycopg2/httpx/sentence-transformers not
+        # installed). This silently disables RAG for the whole run, so make it
+        # impossible to miss. (C4 fix)
+        _raglog("=" * 72)
+        _raglog("!!! RAG DISABLED — MISSING DEPENDENCY !!!")
+        _raglog(f"    {type(e).__name__}: {e}")
+        _raglog("    Install full requirements to enable historical retrieval:")
+        _raglog("        pip install -r requirements.txt")
+        _raglog("    Continuing WITHOUT historical context (quality degraded).")
+        _raglog("=" * 72)
+        return [], {"error": f"rag_disabled_missing_dependency: {e}", "elapsed": time.time() - t0}
     except Exception as e:
         _raglog(f"RETRIEVAL FAILED (non-fatal): {type(e).__name__}: {e}")
         return [], {"error": str(e), "elapsed": time.time() - t0}

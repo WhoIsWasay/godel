@@ -56,11 +56,16 @@ def supervisor_node(state: GraphState, llm_pro):
     try:
         # strict=False prevents crashes from unescaped newlines
         decision = json.loads(raw_content, strict=False)
-        
+
         # Defend against LLM hallucinating an array instead of an object
         if isinstance(decision, list):
             decision = decision[0] if len(decision) > 0 else {}
-            
+
+        # Defend against scalar/string JSON (e.g. '"APPROVED"') crashing on
+        # .get() below — treat it as a parse failure and force a heal cycle.
+        if not isinstance(decision, dict):
+            raise ValueError(f"Supervisor output is not a JSON object: {type(decision).__name__}")
+
         status = decision.get("status", "APPROVED").upper()
         
         return {
@@ -68,7 +73,7 @@ def supervisor_node(state: GraphState, llm_pro):
             "supervisor_runs": state.get("supervisor_runs", 0) + 1,
             "messages": [AIMessage(content=f"[SUPERVISOR]: {decision.get('thought_process', 'Evaluation complete.')}")]
         }
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, ValueError, AttributeError, TypeError) as e:
         logger.error("[SUPERVISOR JSON ERROR] %s. Forcing rejection to trigger heal.", e)
         return {
             "supervisor_critique": "Failed to parse routing JSON. You must output a valid JSON object.",
@@ -91,6 +96,12 @@ def bug_hunter_node(state: GraphState, inspector: Inspector):
 You are actively auditing the function named: `{focus_func}`. 
 You MUST strictly evaluate this specific function. Do NOT report vulnerabilities found in other parts of the contract. The FULL CONTRACT REFERENCE is provided ONLY so you can cross-reference state variables and view/pure helpers.
 
+A <cfg_abstraction> block may be present inside the isolation packet. It is DETERMINISTIC ground truth produced by a static analyzer (Slither): exact branch conditions, storage reads/writes, external calls, loop counts and High/Medium detector signals for this function (+callees). Your analysis MUST be consistent with it:
+- Never claim a state variable is written (or an external call made) if the block says otherwise.
+- Use its branch_conditions as candidate exploit boundaries to trace with boundary values.
+- Treat detector <signal> entries as PRIORS to investigate, not as findings by themselves.
+- If the block is absent or truncated, proceed from source only — do not invent CFG facts.
+
 === SYSTEM README ===
 {readme}
 
@@ -103,10 +114,19 @@ You MUST strictly evaluate this specific function. Do NOT report vulnerabilities
     if critique:
         input_text += f"\n\n[SUPERVISOR CRITIQUE]: {critique}\nFix your previous analysis based on this feedback."
 
+    retry_n = state.get("hunter_retries", 0)
+    if retry_n > 0:
+        input_text += (
+            f"\n\n[RETRY NOTICE — attempt {retry_n + 1}] Your previous response could not be parsed."
+            "\nOutput STRICT JSON only: a single object with a 'findings' array, no prose, "
+            "no markdown fences beyond ```json, no trailing commas, all strings double-quoted."
+        )
+
     raw_response = inspector._invoke(inspector.isolator_agent, inspector.isolator_prompt, input_text)
     
     # --- ROBUST JSON EXTRACTION ---
     findings = []
+    parse_error = None
     clean_response = re.sub(r'<think>.*?</think>', '', raw_response, flags=re.DOTALL).strip()
     
     try:
@@ -129,17 +149,26 @@ You MUST strictly evaluate this specific function. Do NOT report vulnerabilities
             # Fallback to the original external extractor if all else fails
             parsed_data = inspector.extract_json(raw_response)
             findings = parsed_data.get("findings", [])
-        except Exception:
+            parse_error = None
+        except Exception as fallback_err:
             findings = []
+            parse_error = f"Primary JSON parse failed ({e}); fallback extractor failed ({fallback_err})."
             
     if not isinstance(findings, list):
         findings = []
-        
-    if not findings:
+        parse_error = "Isolator output 'findings' was not a list."
+
+    if not findings and not parse_error:
         print(f"      [BUG HUNTER] No vulnerabilities detected in {state.get('current_focus_function')}. Exiting early.")
-        
+    elif parse_error:
+        # Never let malformed LLM output masquerade as a clean safety verdict.
+        logger.error("[BUG HUNTER PARSE FAILURE] %s", parse_error)
+        print(f"      [BUG HUNTER ERROR] Could not parse Isolator output — flagged as analysis failure, NOT as 'safe'.")
+
     return {
         "findings": findings,
+        "hunter_parse_error": parse_error,
+        "hunter_retries": (retry_n + 1) if parse_error else 0,
         "messages": [AIMessage(content=f"[BUG HUNTER]: Proposed {len(findings)} findings.")]
     }
 
@@ -159,9 +188,10 @@ def specifier_node(state: GraphState, generator: PropertyGenerator):
         print(f"      [RAG WARNING] specifier RAG retrieval failed (non-fatal): {e}")
 
     generator.build_prompt(
-        {"intent": finding.get("intent", ""), "queries": rag_diag.get("queries", [])}, 
-        state["user_contract"], 
-        rag_findings
+        {"intent": finding.get("intent", ""), "queries": rag_diag.get("queries", [])},
+        state["user_contract"],
+        rag_findings,
+        semantic_harness=state.get("semantic_harness"),
     )
     
     z3_code_raw = generator.propertyGeneration()
@@ -191,16 +221,23 @@ def executor_node(state: GraphState, cegis_tool: CEGIS):
         }
 
     print(f"      [EXECUTOR] Running symbolic execution (Iteration {state.get('iterations', 0)})...")
-    result = cegis_tool.run_z3(z3_code)
-    
+    result = cegis_tool.run_with_repair(z3_code)
+    if result.get("repairs_used"):
+        print(f"      [CEGIS] {result['repairs_used']} repair(s) applied inside executor")
+
     updates = {
         "z3_result": result,
         "iterations": state.get("iterations", 0) + 1,
         "executor_runs": state.get("executor_runs", 0) + 1,
     }
-    
+
     if result["status"] == "sat":
-        updates["bug_report"] = f"[Z3] Counterexample found:\n{result['output']}"
+        cex = result.get("counterexample") or {}
+        cex_txt = ""
+        if cex.get("assignments"):
+            cex_txt = "\nConcrete counterexample assignments: " + ", ".join(
+                f"{k}={v}" for k, v in sorted(cex["assignments"].items()))
+        updates["bug_report"] = f"[Z3] Counterexample found:\n{result['output']}{cex_txt}"
         updates["messages"] = [AIMessage(content="[EXECUTOR]: SAT. Counterexample found. Passing to Gatekeeper.")]
     elif result["status"] == "unsat":
         updates["messages"] = [AIMessage(content="[EXECUTOR]: UNSAT. Property holds safely.")]
@@ -214,47 +251,61 @@ def executor_node(state: GraphState, cegis_tool: CEGIS):
 
 def gatekeeper_node(state: GraphState, gatekeeper: FoundryGatekeeper):
     """Verifies EVM exploitability."""
-    
-    finding = state["findings"][0] if state.get("findings") else {}
-    if not gatekeeper.is_finding_in_scope(finding, state):
-        return {"findings": [], "messages": [AIMessage(content="[GATEKEEPER]: Finding out of scope. Dropped.")]}
+
+    # Defensive ordering: check for a finding BEFORE consulting the scope
+    # filter (is_finding_in_scope dereferences the dict).
+    remaining_findings = state.get("findings", []) or []
+    finding = remaining_findings[0] if remaining_findings else {}
     if not finding:
         return {"messages": [AIMessage(content="[GATEKEEPER]: No finding to verify.")]}
+    if not gatekeeper.is_finding_in_scope(finding, state):
+        # Consume this finding but keep any others queued for verification.
+        return {
+            "findings": remaining_findings[1:],
+            "messages": [AIMessage(content="[GATEKEEPER]: Finding out of scope. Dropped.")]
+        }
         
     # =====================================================================
-    # --- AUTOMATED ENTERPRISE FIX: MATERIALIZE FILE FOR FOUNDRY ---
-    import os
-    import re
-    
-    # 1. Extract the REAL contract name from the source code (e.g., "SubscriptionBillingManager")
-    # This prevents crashes if the original file was generically named "contract.sol"
-    match = re.search(r'contract\s+([A-Za-z0-9_]+)', state["user_contract"])
-    real_contract_name = match.group(1) if match else state['contract_name']  
-    real_filename = f"{real_contract_name}_{uuid.uuid4().hex[:6]}.sol"
-    
-    # 2. Ensure the src/ directory exists
-    os.makedirs(str(config.FOUNDRY_ROOT / "src"), exist_ok=True)
-    
-    # 3. Write the exact code into the src/ folder so Forge can always find it
-    target_src_file = os.path.join(str(config.FOUNDRY_ROOT / "src"), real_filename)
+    # --- MATERIALIZE FILE FOR FOUNDRY (with guaranteed cleanup) ---
+    # A stale src/ file with unresolved imports breaks compilation for every
+    # subsequent forge run, so the file is removed in a finally block.
+    real_contract_name = FoundryGatekeeper.extract_contract_name(
+        state["user_contract"], fallback=state.get('contract_name')
+    )
     try:
-        with open(target_src_file, "w", encoding="utf-8") as f:
-            f.write(state["user_contract"])
+        target_src_file = gatekeeper.materialize_source(state["user_contract"], real_contract_name)
+        materialized = True
     except Exception as e:
         logger.warning("[GATEKEEPER WARNING] Failed to materialize source file: %s", e)
-    # =====================================================================
+        target_src_file = None
+        materialized = False
+
+    try:
+        return _gatekeeper_verify(state, gatekeeper, finding, remaining_findings,
+                                  real_contract_name, target_src_file)
+    finally:
+        if materialized:
+            gatekeeper.cleanup_source(target_src_file)
+
+
+def _gatekeeper_verify(state, gatekeeper, finding, remaining_findings,
+                       real_contract_name, target_src_file):
+    """Core verification path; separated so src/ cleanup always runs above."""
 
     print(f"      [GATEKEEPER] Generating native EVM test suite for {finding.get('target_function')}...")
     
-    # Per-finding artifact dir: all gatekeeper debug output lands here (task #17)
+    # Per-finding artifact dir: all gatekeeper debug output lands here (task #17).
+    # Unique suffix prevents overloaded functions (same name, different
+    # signatures) racing on the same folder across threads.
     finding_dir = os.path.join(
         str(config.SUBMISSIONS_FOLDER),
         state.get("contract_name", "unknown"),
-        finding.get("target_function", "unknown"),
+        f"{finding.get('target_function', 'unknown')}_{uuid.uuid4().hex[:6]}",
     )
     os.makedirs(finding_dir, exist_ok=True)
 
     # Pass the real filename we just created to the Verifier agent
+    real_filename = os.path.basename(target_src_file) if target_src_file else f"{real_contract_name}.sol"
     test_suite = gatekeeper.verifier_agent.generate_test_suite(
         finding, state, state["user_contract"], real_filename
     )
@@ -273,11 +324,12 @@ def gatekeeper_node(state: GraphState, gatekeeper: FoundryGatekeeper):
         current_bugs = state.get("verified_bugs", [])
         return {
             "verified_bugs": current_bugs + [new_bug],
+            "findings": remaining_findings[1:],
             "messages": [AIMessage(content="[GATEKEEPER]: Bug CONFIRMED in EVM execution.")]
         }
     elif qc_status == "property_held":
         return {
-            "findings": [],
+            "findings": remaining_findings[1:],
             "messages": [AIMessage(content="[GATEKEEPER]: FALSE POSITIVE. Property held during EVM execution. Dropping finding.")]
         }
     else:
@@ -292,6 +344,7 @@ def gatekeeper_node(state: GraphState, gatekeeper: FoundryGatekeeper):
         current_bugs = state.get("verified_bugs", [])
         return {
             "verified_bugs": current_bugs + [new_bug],
+            "findings": remaining_findings[1:],
             "messages": [AIMessage(content=f"[GATEKEEPER]: Execution failed ({qc_status}). Pushing Z3-proven bug to manual review.")]
         }
 
@@ -319,7 +372,12 @@ def fixer_node(state: GraphState, fixer: FixerAgent, formatter: SubmissionFormat
 
     contract_name = state.get("contract_name", "unknown")
     function_name = finding.get("target_function", "unknown")
-    folder_path = os.path.join(str(config.SUBMISSIONS_FOLDER), contract_name, function_name)
+    # Unique suffix: overloaded functions (same name, different signatures)
+    # would otherwise race two threads writing the same folder.
+    folder_path = os.path.join(
+        str(config.SUBMISSIONS_FOLDER), contract_name,
+        f"{function_name}_{uuid.uuid4().hex[:6]}"
+    )
     os.makedirs(folder_path, exist_ok=True)
 
     finding_dict = build_finding(
@@ -352,13 +410,18 @@ def fixer_node(state: GraphState, fixer: FixerAgent, formatter: SubmissionFormat
     except IOError as e:
         msg = f"[FIXER ERROR]: Failed to save report: {e}"
 
-    latest_bug["fix_code"] = fixed_code
+    # Copy-on-write: never mutate the shared state dict in place (bypasses
+    # channel reducers; fragile under checkpointing).
+    updated_bugs = [dict(b) for b in verified_bugs]
+    updated_bugs[-1]["fix_code"] = fixed_code
 
     return {
-        "verified_bugs": verified_bugs,
-        "findings": [],
+        "verified_bugs": updated_bugs,
+        # Do NOT clear "findings" here: with multi-finding processing, any
+        # still-queued findings must survive so routing can continue them.
         "z3_code": "",
         "bug_report": None,
+        "supervisor_critique": None,
         "iterations": 0,
         "messages": [AIMessage(content=msg)]
     }

@@ -7,7 +7,7 @@ from domain.llm_utils import call_with_retry
 
 class PropertyGenerator:
 
-    with open(PROMPTS_DIR / "property_generator_prompt.txt", "r") as f:
+    with open(PROMPTS_DIR / "property_generator_prompt.txt", "r", encoding="utf-8") as f:
         SYSTEM_PROMPT = f.read()
 
     def __init__(self, agent):
@@ -52,11 +52,34 @@ class PropertyGenerator:
 
 
 
-    def build_prompt(self, expansion: dict, contract: str, findings: list[dict]) -> None:
+    def build_prompt(self, expansion: dict, contract: str, findings: list[dict],
+                     semantic_harness: dict | None = None) -> None:
         intent = expansion["intent"]
         queries = expansion["queries"]
         formatted_queries = "\n".join(f"- {q}" for q in queries)
         formatted_findings = self.format_findings(findings)
+
+        if semantic_harness:
+            from domain.semantics import PROPERTY_PROTOCOL_COMMENT
+            harness_section = f"""
+        === DETERMINISTIC SEMANTIC MODEL (authoritative — generated from static analysis) ===
+        ```python
+        {semantic_harness['code']}
+        ```
+        Model quality: {semantic_harness['quality']}.
+        Unmodeled (havocked, i.e. free) parts: {json.dumps(semantic_harness['untranslated'], indent=2)}
+        Standing assumptions: {json.dumps(semantic_harness['assumptions'])}
+
+        {PROPERTY_PROTOCOL_COMMENT}
+        You MUST use build_model() and the V[...] symbols. Do NOT re-declare state
+        variables or invent semantics that contradict the model.
+        """
+        else:
+            harness_section = """
+        No deterministic model is available for this function: encode the Solidity
+        semantics yourself with Z3 as before. Be conservative: anything you cannot
+        faithfully encode must remain a free/unconstrained variable.
+        """
 
         self.prompt = f"""=== VERIFICATION INTENT ===
         {intent}
@@ -69,7 +92,7 @@ class PropertyGenerator:
 
         === HISTORICAL FINDINGS ===
         {formatted_findings}
-
+        {harness_section}
         === TASK ===
         Generate Z3 Python code that encodes and tests the above verification intent.
         Use the exact variable names from the contract. Encode edge cases derived from the findings.

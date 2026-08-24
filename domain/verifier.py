@@ -69,6 +69,15 @@ class PropertyVerifierAgent:
         <law id="8" title="NO FOUNDRY TEMPLATE HALLUCINATIONS">
             You are strictly forbidden from importing or referencing default Foundry template files. NEVER output `import {{Counter}} from "../src/Counter.sol";`. NEVER instantiate a `Counter` contract. You must ONLY import the target contract provided in the context.
         </law>
+
+        <law id="9" title="MULTI-TRANSACTION EXPLOIT SEQUENCES">
+            When the Extracted Tool Logs describe a state sequence, a cross-function interaction, reentrancy, or concrete counterexample values that cannot be reached in a single call, you MUST write an explicit ordered exploit SEQUENCE inside a `test_` function instead of relying on invariant fuzzing:
+            1. In `setUp()`, deploy and fund all actors (use `vm.deal` for ETH, mock tokens for ERC20).
+            2. In the test body, execute the transactions IN ORDER exactly as the trace describes, one call per line, using `vm.prank(attacker)` / `vm.startPrank` / `vm.stopPrank` when the acting account matters.
+            3. Reentrancy traces: implement the attacker callback contract explicitly and trigger it via the external call site named in the trace.
+            4. After the final transaction, assert the SAFE invariant per Law 4 (a real bug then makes the test FAIL).
+            Prefer this explicit-sequence style whenever the trace provides concrete values; use fuzz/invariant mode only for single-call properties.
+        </law>
     </critical_execution_laws>
 </verification_engineer_directive>"""),
             ("user", """### TARGET CONTRACT CODE:
@@ -90,6 +99,12 @@ Please read the target contract source meticulously, parse out its true interfac
         z3_result = result_state.get("z3_result")
         if z3_result and z3_result.get("status") == "sat" and z3_result.get("output"):
             facts = str(OutputExtractor.parse_z3_counterexample(z3_result["output"]))
+            # Phase 2: structured counterexample assignments give exact
+            # attacker-controlled values for the exploit sequence.
+            cex = z3_result.get("counterexample") or {}
+            if isinstance(cex, dict) and cex.get("assignments"):
+                facts += "\nCONCRETE COUNTEREXAMPLE ASSIGNMENTS (use these exact values in the sequence): " + \
+                         ", ".join(f"{k}={v}" for k, v in sorted(cex["assignments"].items()))
         else:
             raw_report = result_state.get("bug_report", "")
             facts = str(OutputExtractor.parse_slither_json(raw_report, func_name))

@@ -1,4 +1,5 @@
 import os
+import shutil
 import logging
 from pathlib import Path
 
@@ -6,6 +7,36 @@ from pathlib import Path
 def _env_int(name, default):
     value = os.environ.get(name)
     return int(value) if value and value.isdigit() else default
+
+
+def find_tool(name: str) -> str:
+    """Locate an external binary: PATH first, then well-known install dirs
+    (foundryup does NOT add itself to PATH on fresh machines, which made every
+    Gatekeeper run degrade to 'tool_missing'). Returns the resolved path, or
+    the bare name so subprocess errors stay familiar."""
+    found = shutil.which(name)
+    if found:
+        return found
+
+    suffixes = [name] if os.name != "nt" else [name + ".exe", name]
+    search_dirs = [
+        Path.home() / ".foundry" / "bin",
+        Path("/usr/local/bin"),
+        Path("/usr/bin"),
+        Path("C:/Program Files/solc"),
+    ]
+    for d in search_dirs:
+        for suf in suffixes:
+            candidate = d / suf
+            if candidate.is_file():
+                return str(candidate)
+    return name
+
+
+# Resolved external tool binaries (fall back to bare name; gatekeeper's
+# FileNotFoundError handler still covers a genuinely missing install).
+FORGE_BIN = find_tool("forge")
+SOLC_BIN = find_tool("solc")
 
 
 def _env_float(name, default):
@@ -28,8 +59,10 @@ FOUNDRY_ROOT = Path(os.environ.get("GODEL_FOUNDRY_ROOT", str(PROJECT_ROOT)))
 # Output root (overridable so CI can point artifacts somewhere explicit)
 OUTPUT_DIR = Path(os.environ.get("GODEL_OUTPUT_DIR", str(PROJECT_ROOT / "output")))
 
-# Default contracts folder for local runs (always overridable via --contracts / env)
-CONTRACTS_FOLDER = os.environ.get("GODEL_CONTRACTS_FOLDER", "FolderName")
+# Default contracts folder for local runs (always overridable via --contracts / env).
+# Empty by default so a bare run fails LOUDLY with instructions instead of
+# silently auditing nothing (audit fix: "FolderName" placeholder pointed nowhere).
+CONTRACTS_FOLDER = os.environ.get("GODEL_CONTRACTS_FOLDER", "")
 
 XML_OUTPUT_FOLDER  = OUTPUT_DIR / "xml"
 FINDINGS_FOLDER    = OUTPUT_DIR / "findings"
@@ -46,12 +79,17 @@ DEBUG_FOLDER       = OUTPUT_DIR / "debug_tests"
 SUPERVISOR_MAX_ITERATIONS = _env_int("GODEL_SUPERVISOR_MAX_ITERATIONS", 3)
 EXECUTOR_MAX_ITERATIONS    = _env_int("GODEL_EXECUTOR_MAX_ITERATIONS", 4)
 GATEKEEPER_MAX_RETRIES     = _env_int("GODEL_GATEKEEPER_MAX_RETRIES", 3)
+HUNTER_MAX_PARSE_RETRIES   = _env_int("GODEL_HUNTER_PARSE_RETRIES", 2)
 
 # ==========================================
 # TIMEOUTS
 # ==========================================
 PER_FUNCTION_TIMEOUT = _env_float("GODEL_PER_FUNCTION_TIMEOUT", 600.0)
 MAX_WORKERS          = _env_int("GODEL_MAX_WORKERS", 2)
+
+# Tool timeouts (previously hardcoded in z3_runner.py / gatekeeper.py)
+Z3_TIMEOUT_SECONDS   = _env_float("GODEL_Z3_TIMEOUT", 30.0)
+FORGE_TIMEOUT_SECONDS = _env_float("GODEL_FORGE_TIMEOUT", 45.0)
 
 # ==========================================
 # LLM RETRY

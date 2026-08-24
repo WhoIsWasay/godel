@@ -1,12 +1,20 @@
 import os
 import re
+import sys
 import textwrap
 
 # ==========================================
-# ⚙️ CONFIGURATION: HARDCODE YOUR PATH HERE
+# ⚙️ CONFIGURATION: pass a path on the CLI instead:
+#     python piyoxml.py path/to/Contract.sol
 # ==========================================
-# FILE_TO_PARSE = "Slingshot.sol" 
-# ==========================================
+
+
+def cdata(text: str) -> str:
+    """Wrap text in a CDATA section safely: a literal ']]>' inside the content
+    is escaped using the standard split technique so real XML parsers never
+    choke (audit fix: expressions like a[b[c]]>=x used to break CDATA)."""
+    safe = text.replace("]]>", "]]]]><![CDATA[>")
+    return f"<![CDATA[{safe}]]>"
 
 def create_index_mask(text):
     """
@@ -44,7 +52,7 @@ def parse_solidity_to_xml(file_path) -> str:
         for m in env_matches:
             # Extract the raw statement using coordinates found in the mask
             raw_statement = full_text[m.start():m.end()].strip()
-            xml_output.append(f"        <![CDATA[{raw_statement}]]>")
+            xml_output.append(f"        {cdata(raw_statement)}")
         xml_output.append("    </environment_setup>\n")
 
     # Extract Top-Level Containers (contract, interface, library)
@@ -108,8 +116,14 @@ def process_inner_block(b_type, b_name, inner_start, inner_end, original, masked
     for fm in func_matches:
         f_start = fm.start() + inner_start
         f_keyword = fm.group(1)
-        
-        # Extract precise name anchored to the keyword
+
+        # Extract precise name anchored to the keyword.
+        # A 'function' keyword followed directly by '(' is a FUNCTION-TYPE
+        # STATE VARIABLE (e.g. `function(uint) external callback;`) — it must
+        # stay in <state_variables>, not be carved out as a function.
+        if f_keyword == 'function':
+            if not re.match(r'\bfunction\s+[A-Za-z_$][\w$]*\s*\(', masked[f_start:inner_end]):
+                continue
         name = f_keyword
         if f_keyword in ['function', 'modifier']:
             name_match = re.match(r'\b(?:function|modifier)\s+([a-zA-Z0-9_]+)', masked[f_start:inner_end])
@@ -184,18 +198,18 @@ def process_inner_block(b_type, b_name, inner_start, inner_end, original, masked
         state_text_clean = "\n".join(state_lines_unfiltered)
         state_dedented = textwrap.dedent(state_text_clean).strip()
         clean_state = "\n".join([f"{indent}        {line}" for line in state_dedented.splitlines()])
-        
+
         inner_xml.append(f'{indent}    <state_variables>')
-        inner_xml.append(f'{indent}        <![CDATA[\n{clean_state}\n{indent}        ]]>')
+        inner_xml.append(f'{indent}        {cdata(chr(10) + clean_state + chr(10) + indent + "        ")}')
         inner_xml.append(f'{indent}    </state_variables>')
-        
+
     # Format Functions cleanly
     for fd in functions_data:
         inner_xml.append(f'{indent}    <function name="{fd["name"]}" type="{fd["type"]}">')
         func_code_dedented = textwrap.dedent(fd["code"]).strip()
         func_code_formatted = "\n".join([f"{indent}        {line}" for line in func_code_dedented.splitlines()])
-        
-        inner_xml.append(f'{indent}        <![CDATA[\n{func_code_formatted}\n{indent}        ]]>')
+
+        inner_xml.append(f'{indent}        {cdata(chr(10) + func_code_formatted + chr(10) + indent + "        ")}')
         inner_xml.append(f'{indent}    </function>')
         
     inner_xml.append(f'{indent}</{b_type}>')
@@ -203,6 +217,9 @@ def process_inner_block(b_type, b_name, inner_start, inner_end, original, masked
 
 
 if __name__ == "__main__":
-    parse_solidity_to_xml(FILE_TO_PARSE)
-    
-    # pass
+    if len(sys.argv) < 2:
+        print("Usage: python piyoxml.py <path/to/Contract.sol>")
+        sys.exit(1)
+    result = parse_solidity_to_xml(sys.argv[1])
+    if result:
+        print(result)

@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       contract_folder:
-        description: "Path to the contract folder to audit (e.g. CollateralizeDebtPosition)"
-        required: false
-        default: ""
+        description: "Path to the contract folder to audit (required)"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -36,13 +36,20 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
+      - name: Preflight doctor
+        run: python main.py --doctor
+
       - name: Resolve contracts folder
         id: folder
         shell: bash
         run: |
           FOLDER="${{ github.event.inputs.contract_folder }}"
           if [ -z "$FOLDER" ]; then
-            FOLDER="${GODEL_CONTRACTS_FOLDER:-CollateralizeDebtPosition}"
+            FOLDER="${GODEL_CONTRACTS_FOLDER:-}"
+          fi
+          if [ -z "$FOLDER" ] || [ ! -d "$FOLDER" ]; then
+            echo "::error::No valid contract folder. Set workflow input 'contract_folder' or the GODEL_CONTRACTS_FOLDER repo variable (got: '$FOLDER')."
+            exit 1
           fi
           echo "path=$FOLDER" >> "$GITHUB_OUTPUT"
           echo "Auditing contract folder: $FOLDER"

@@ -6,6 +6,15 @@ openai==2.43.0
 python-dotenv==1.2.2
 z3-solver==4.16.0.0
 
-# MCP server only (Phase 7 face) — not needed for CI/CD or the pipeline:
-#   pip install fastmcp
+# Static analyzer / CFG extraction (Phase 1 abstracter layer)
+slither-analyzer>=0.11.0
+solc-select>=2.1.0
 
+# RAG bridge (Infrastructure/postgres.py + domain/rag.py) — previously
+# missing, which silently disabled RAG in Docker/CI (C4 fix)
+psycopg2-binary>=2.9.9
+httpx>=0.27.0
+sentence-transformers>=3.0.0
+
+# MCP server (mcp_server.py)
+fastmcp>=2.0.0

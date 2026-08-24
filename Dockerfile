@@ -20,6 +20,6 @@ RUN pip install -r requirements.txt
 COPY . .
 
 # Verify toolchain present; contracts are compiled on-demand by the pipeline.
-RUN forge --version && python -c "import z3, langchain_core, langgraph; print('deps ok')"
+RUN forge --version && python -c "import z3, langchain_core, langgraph, slither; print('deps ok')"
 
 ENTRYPOINT ["python", "main.py"]
