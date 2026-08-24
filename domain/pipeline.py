@@ -5,6 +5,7 @@ import logging
 import tempfile
 import traceback
 import concurrent.futures
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -14,6 +15,8 @@ from langgraph.graph import StateGraph, END
 
 from piyoxml import parse_solidity_to_xml
 from domain import config
+from domain.abstracter import abstract_contract, render_cfg_slice
+from domain.semantics import generate_harness
 from domain.inspector import Inspector
 from domain.propertygenerator import PropertyGenerator
 from domain.cegis import CEGIS
@@ -83,40 +86,120 @@ cegis = CEGIS(agent=llm_pro, run_z3_tool=run_z3)
 # ==========================================
 # HELPER FUNCTIONS
 # ==========================================
+def _strip_cdata(text: str) -> str:
+    """XML-style CDATA extraction: walks section boundaries exactly like a
+    real parser, so piyoxml.cdata()'s ']]]]><![CDATA[>' escaping round-trips
+    back to the original ']]>' text (a naive global replace corrupts it)."""
+    parts = []
+    idx = 0
+    while True:
+        start = text.find("<![CDATA[", idx)
+        if start == -1:
+            parts.append(text[idx:])
+            break
+        parts.append(text[idx:start])
+        end = text.find("]]>", start + 9)
+        if end == -1:
+            parts.append(text[start + 9:])
+            break
+        parts.append(text[start + 9:end])
+        idx = end + 3
+    return "".join(parts).strip()
+
+
 def extract_element_text(xml_string: str, tag_name: str) -> str:
+    """All text content under every occurrence of <tag_name>, CDATA decoded
+    natively. Primary path uses a real XML parser (immune to literal
+    '</tag>' sequences inside CDATA-wrapped Solidity strings that truncate
+    the legacy regex mid-element); falls back to the regex walk only when
+    the document is malformed."""
+    root = _parse_audit_xml(xml_string)
+    if root is not None:
+        chunks = []
+        for el in root.iter(tag_name):
+            text = "".join(el.itertext()).strip()
+            if text:
+                chunks.append(text)
+        return "\n".join(chunks)
     pattern = rf"<{tag_name}.*?>(.*?)</{tag_name}>"
     matches = re.findall(pattern, xml_string, re.DOTALL)
     cleaned = []
     for m in matches:
-        c = m.replace("<![CDATA[", "").replace("]]>", "").strip()
+        c = _strip_cdata(m)
         if c:
             cleaned.append(c)
     return "\n".join(cleaned)
 
 
 def extract_functions_from_xml(xml_string: str) -> list:
+    root = _parse_audit_xml(xml_string)
+    functions = []
+    if root is not None:
+        for el in root.iter("function"):
+            name = el.get("name")
+            body = "".join(el.itertext()).strip()
+            if not name or "{" not in body:
+                continue
+            functions.append({"name": name, "body": body})
+        return functions
     pattern = r'<function\s+name="([^"]+)"[^>]*>(.*?)</function>'
     matches = re.findall(pattern, xml_string, re.DOTALL)
-    functions = []
     for name, body in matches:
         if "{" not in body:
             continue
-        cleaned_body = body.replace("<![CDATA[", "").replace("]]>", "").strip()
-        functions.append({"name": name, "body": cleaned_body})
+        functions.append({"name": name, "body": _strip_cdata(body)})
     return functions
 
 
+def _parse_audit_xml(xml_string: str):
+    """Returns the parsed root Element of piyoxml output, or None when the
+    document is not well-formed (callers degrade to the legacy regex path
+    instead of failing the audit — non-fatal by contract)."""
+    try:
+        return ET.fromstring(xml_string)
+    except ET.ParseError:
+        return None
+
+
 def collect_sol_files(folder: str) -> list:
+    # Absolute paths are mandatory here: domain.abstracter temporarily chdirs
+    # the whole process into an isolated tmpdir while Slither runs, so any
+    # thread resolving a relative path during that window would read from the
+    # wrong directory.
     sol_files = []
     for root, _, files in os.walk(folder):
         for file in sorted(files):
             if file.endswith(".sol"):
-                sol_files.append(os.path.join(root, file))
+                sol_files.append(os.path.abspath(os.path.join(root, file)))
     return sol_files
 
 
-def process_function(func, raw_solidity_code, stem, readme, env_setup, interfaces, state_vars, app):
+def batch_timeout_for(n_functions: int) -> float:
+    """Wall-clock budget for one contract's parallel function graphs.
+
+    Functions run MAX_WORKERS-at-a-time, so the budget scales with the
+    number of sequential waves (ceil(n / workers)) rather than the raw
+    function count — a per-function-times-count cap massively over-waits
+    large contracts and delays the timeout-salvage path."""
+    workers = max(1, config.MAX_WORKERS)
+    waves = max(1, (max(0, int(n_functions)) + workers - 1) // workers)
+    return config.PER_FUNCTION_TIMEOUT * waves
+
+
+def process_function(func, raw_solidity_code, stem, readme, env_setup, interfaces, state_vars, app,
+                     static_analysis=None):
     print(f"  -> Spawning Graph Thread for [{func['name']}]...")
+
+    cfg_block = ""
+    harness = None
+    if static_analysis and not config.is_dry_run():
+        cfg_block = render_cfg_slice(static_analysis, func["name"])
+        if cfg_block:
+            print(f"      [ABSTRACTER] CFG slice attached for {func['name']} ({len(cfg_block)} chars)")
+        harness = generate_harness(static_analysis, func["name"])
+        if harness:
+            print(f"      [SEMANTICS] deterministic model ready for {func['name']} "
+                  f"(quality={harness['quality']}, untranslated={len(harness['untranslated'])})")
 
     injection_packet = f"""<analysis_packet>
     <environment_wiring>
@@ -124,6 +207,7 @@ def process_function(func, raw_solidity_code, stem, readme, env_setup, interface
         <interfaces>{interfaces}</interfaces>
         <global_storage_slots>{state_vars}</global_storage_slots>
     </environment_wiring>
+{cfg_block}
     <target_isolated_function>
 {func['body']}
     </target_isolated_function>
@@ -144,11 +228,14 @@ def process_function(func, raw_solidity_code, stem, readme, env_setup, interface
         "verified_bugs": [],
         "z3_code": "",
         "z3_result": None,
-        "slither_result": None,
+        "slither_result": static_analysis,
+        "semantic_harness": harness,
+        "model_quality": harness["quality"] if harness else None,
         "bug_report": None,
         "iterations": 0,
         "supervisor_runs": 0,
         "executor_runs": 0,
+        "hunter_retries": 0,
         "poc_test_code": "",
         "forge_output": "",
         "qc_status": "",
@@ -183,6 +270,15 @@ def node_fixer(state: GraphState): return fixer_node(state, fixer, formatter)
 # GRAPH ROUTING LOGIC (Escalation Pipeline)
 # ==========================================
 def route_after_hunter(state: GraphState) -> str:
+    if state.get("hunter_parse_error") and not state.get("findings"):
+        # Unparseable Isolator output must never masquerade as 'safe', and it
+        # should not dead-end either — retry bounded by hunter_retries.
+        if state.get("hunter_retries", 0) < config.HUNTER_MAX_PARSE_RETRIES:
+            print(f"      [ROUTING] Hunter output unparseable — retrying "
+                  f"({state.get('hunter_retries', 0) + 1}/{config.HUNTER_MAX_PARSE_RETRIES})")
+            return "bug_hunter"
+        print("      [ROUTING] Hunter retries exhausted — aborting as analysis_failed.")
+        return END
     if not state.get("findings"):
         print(f"      [BUG HUNTER] No vulnerabilities detected in {state.get('current_focus_function')}. Exiting early.")
         return END
@@ -200,15 +296,22 @@ def route_after_supervisor(state: GraphState) -> str:
 
 
 def route_after_specifier(state: GraphState) -> str:
-    if state.get("supervisor_critique"):
+    # A critique left over from an Executor Z3 error is repair feedback for the
+    # specifier itself — do NOT detour through the supervisor (that would burn
+    # SUPERVISOR_MAX_ITERATIONS slots and can restart the whole hunter loop).
+    res = state.get("z3_result", {}) or {}
+    last_status = res.get("status")
+    if state.get("supervisor_critique") and last_status not in ("error", "inconclusive"):
         return "supervisor"
     return "executor"
 
 
 def route_after_executor(state: GraphState) -> str:
-    res = state.get("z3_result", {})
+    res = state.get("z3_result", {}) or {}
     status = res.get("status")
-    if status == "error":
+    if status in ("error", "inconclusive"):
+        # inconclusive = script ran but printed no unambiguous verdict sentinel;
+        # both cases need a regenerated/refined property, not a verdict.
         if state.get("executor_runs", 0) >= config.EXECUTOR_MAX_ITERATIONS:
             return END
         return "specifier"
@@ -220,6 +323,18 @@ def route_after_executor(state: GraphState) -> str:
 def route_after_gatekeeper(state: GraphState) -> str:
     if state.get("verified_bugs"):
         return "fixer"
+    if state.get("findings"):
+        # Current finding was dropped (out of scope / false positive) but more
+        # findings are queued for this function — keep verifying them.
+        return "specifier"
+    return END
+
+
+def route_after_fixer(state: GraphState) -> str:
+    if state.get("findings"):
+        # More queued findings for this function remain after a successful
+        # remediation cycle.
+        return "specifier"
     return END
 
 
@@ -233,7 +348,11 @@ def build_godel_graph():
     workflow.add_node("gatekeeper", node_gatekeeper)
     workflow.add_node("fixer", node_fixer)
 
-    workflow.add_conditional_edges("bug_hunter", route_after_hunter)
+    workflow.add_conditional_edges(
+        "bug_hunter",
+        route_after_hunter,
+        {"supervisor": "supervisor", "bug_hunter": "bug_hunter", END: END},
+    )
 
     workflow.add_conditional_edges(
         "supervisor",
@@ -256,10 +375,15 @@ def build_godel_graph():
     workflow.add_conditional_edges(
         "gatekeeper",
         route_after_gatekeeper,
-        {"fixer": "fixer", END: END},
+        {"fixer": "fixer", "specifier": "specifier", END: END},
     )
 
-    workflow.add_edge("fixer", END)
+    workflow.add_conditional_edges(
+        "fixer",
+        route_after_fixer,
+        {"specifier": "specifier", END: END},
+    )
+
     workflow.set_entry_point("bug_hunter")
 
     return workflow.compile()
@@ -276,10 +400,50 @@ def _timeout_finding(contract_name: str, func_name: str) -> dict:
     )
 
 
+def _classify_terminal_state(final_state: dict) -> str:
+    """Distinguishes a genuine UNSAT-proven 'safe' verdict from aborts and
+    analysis failures — they must never be conflated in reporting."""
+    if final_state.get("hunter_parse_error"):
+        return "analysis_failed (Isolator output unparseable) — NOT proven safe"
+    if final_state.get("verified_bugs"):
+        return f"{len(final_state['verified_bugs'])} verified bug(s)"
+    if final_state.get("findings"):
+        return "aborted with unresolved findings queued"
+    if (final_state.get("supervisor_runs", 0) >= config.SUPERVISOR_MAX_ITERATIONS
+            and final_state.get("supervisor_critique")):
+        return f"aborted: supervisor limit reached ({config.SUPERVISOR_MAX_ITERATIONS}) — review pending critique"
+    res = final_state.get("z3_result", {}) or {}
+    if (final_state.get("executor_runs", 0) >= config.EXECUTOR_MAX_ITERATIONS
+            and res.get("status") in ("error", "inconclusive")):
+        return f"aborted: executor exhausted retries on Z3 errors — inconclusive, NOT proven safe"
+    if res.get("status") == "unsat":
+        # Honest labeling: the strength of the claim must reflect the strength
+        # of the model that produced it.
+        quality = final_state.get("model_quality")
+        if quality == "FULL":
+            return "verified safe (UNSAT · exact deterministic static-analysis model)"
+        if quality == "PARTIAL":
+            return "safe under over-approximated model (UNSAT · partial static encoding)"
+        return "verified mathematically safe (UNSAT)"
+    if res.get("status") in ("error", "inconclusive"):
+        return "inconclusive: Z3 never produced an unambiguous verdict"
+    return "ended without verification (no Z3 verdict recorded)"
+
+
 def run_pipeline(contract_folder: str = None) -> list:
     """Runs the full audit graph over a folder of .sol files and returns
     a list of FindingSchema dicts (one per verified finding)."""
     contract_folder = contract_folder or config.CONTRACTS_FOLDER
+    if not contract_folder:
+        raise SystemExit(
+            "No contracts folder specified. Pass --contracts <folder> or set "
+            "GODEL_CONTRACTS_FOLDER (audit fix: no more silent zero-finding runs)."
+        )
+    if not os.path.isdir(contract_folder):
+        raise SystemExit(
+            f"Contracts folder does not exist: '{contract_folder}'. "
+            "Pass a valid --contracts <folder> or fix GODEL_CONTRACTS_FOLDER."
+        )
     readme_path = os.path.join(contract_folder, "README.md")
     readme = open(readme_path, "r", encoding="utf-8").read() if os.path.exists(readme_path) else ""
 
@@ -309,6 +473,20 @@ def run_pipeline(contract_folder: str = None) -> list:
 
         raw_solidity_code = open(sol_path, "r", encoding="utf-8").read()
 
+        # Phase 1: static-analysis abstraction layer (non-fatal; deterministic).
+        # Runs once per FILE (whole-contract CFG context), sliced per function
+        # inside process_function. Skipped in dry-run to keep plumbing fast.
+        static_analysis = None
+        if not config.is_dry_run():
+            static_analysis = abstract_contract(sol_path)
+            if static_analysis:
+                n_fns = len(static_analysis.get("functions", {}))
+                n_det = len(static_analysis.get("detectors", []))
+                print(f"  [ABSTRACTER] {stem}: {n_fns} function(s) abstracted, "
+                      f"{n_det} High/Medium detector signal(s)")
+            else:
+                print(f"  [ABSTRACTER] {stem}: static analysis unavailable — continuing without it")
+
         env_setup = extract_element_text(xml_str, "environment_setup")
         interfaces = extract_element_text(xml_str, "interface")
         state_vars = extract_element_text(xml_str, "state_variables")
@@ -319,47 +497,34 @@ def run_pipeline(contract_folder: str = None) -> list:
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=config.MAX_WORKERS)
         future_to_func = {
             executor.submit(process_function, func, raw_solidity_code, stem, readme,
-                            env_setup, interfaces, state_vars, app): func["name"]
+                            env_setup, interfaces, state_vars, app, static_analysis): func["name"]
             for func in functions
         }
-        batch_timeout = config.PER_FUNCTION_TIMEOUT * max(1, len(functions))
+        batch_timeout = batch_timeout_for(len(functions))
+        processed = set()
         try:
             for future in concurrent.futures.as_completed(future_to_func, timeout=batch_timeout):
                 func_name = future_to_func[future]
+                processed.add(id(future))
                 try:
-                    final_state = future.result()
-                    focus_func = final_state.get('current_focus_function', 'unknown')
-                    bugs_found = len(final_state.get('verified_bugs', []))
-
-                    rag_diag = final_state.get("rag_diagnostics") or {}
-                    rag_ps = rag_diag.get("precisions", {})
-                    p5 = rag_ps.get(5, {}).get("p_at_k")
-                    p3 = rag_ps.get(3, {}).get("p_at_k")
-                    p1 = rag_ps.get(1, {}).get("p_at_k")
-                    if p5 is not None:
-                        print(f"      [RAG] {focus_func}: P@1={p1} P@3={p3} P@5={p5} "
-                              f"n_retrieved={rag_diag.get('n_retrieved')} "
-                              f"elapsed={rag_diag.get('elapsed')}s")
-
-                    if bugs_found > 0:
-                        print(f"  [GRAPH OUTPUT] {bugs_found} verified vulnerabilities found & fixed in {focus_func}!")
-                    else:
-                        print(f"  [GRAPH OUTPUT] {focus_func} verified mathematically safe.")
-
-                    for bug in final_state.get("verified_bugs", []):
-                        results.append(build_finding(
-                            bug["finding"],
-                            final_state,
-                            bug.get("fix_code", ""),
-                            bug.get("poc_test_code", ""),
-                            bug.get("forge_output", ""),
-                            bug.get("qc_status", ""),
-                        ))
+                    _collect_future_result(future, func_name, stem, results)
                 except Exception as exc:
                     logger.error("[GRAPH ERROR] %s raised an exception: %s", func_name, exc)
                     traceback.print_exc()
         except concurrent.futures.TimeoutError:
+            # Salvage: futures that finished between the last as_completed yield
+            # and the timeout still hold valid results — collect them instead of
+            # silently discarding (audit fix).
             for future, func_name in future_to_func.items():
+                if id(future) in processed:
+                    continue
+                if future.done() and not future.cancelled():
+                    try:
+                        print(f"      [BATCH TIMEOUT SALVAGE] Collecting late-finished result for {func_name}")
+                        _collect_future_result(future, func_name, stem, results)
+                        continue
+                    except Exception as exc:
+                        logger.error("[GRAPH ERROR] %s raised an exception during salvage: %s", func_name, exc)
                 if not future.done():
                     logger.warning("[GRAPH TIMEOUT] %s exceeded the per-function timeout.", func_name)
                     results.append(_timeout_finding(stem, func_name))
@@ -368,6 +533,44 @@ def run_pipeline(contract_folder: str = None) -> list:
 
     print("\n" + "=" * 50 + "\n=== SYSTEM PIPELINE EXECUTION COMPLETE ===\n" + "=" * 50)
     return results
+
+
+def _collect_future_result(future, func_name: str, stem: str, results: list):
+    """Extracts a finished graph result and appends findings. Shared by the
+    normal completion loop and the batch-timeout salvage path."""
+    final_state = future.result()
+    focus_func = final_state.get('current_focus_function', 'unknown')
+    bugs_found = len(final_state.get('verified_bugs', []))
+
+    rag_diag = final_state.get("rag_diagnostics") or {}
+    rag_ps = rag_diag.get("precisions", {})
+    p5 = rag_ps.get(5, {}).get("p_at_k")
+    p3 = rag_ps.get(3, {}).get("p_at_k")
+    p1 = rag_ps.get(1, {}).get("p_at_k")
+    if p5 is not None:
+        print(f"      [RAG] {focus_func}: P@1={p1} P@3={p3} P@5={p5} "
+              f"n_retrieved={rag_diag.get('n_retrieved')} "
+              f"elapsed={rag_diag.get('elapsed')}s")
+
+    if config.is_dry_run():
+        print(f"  [GRAPH OUTPUT] {focus_func}: dry-run plumbing OK (LLM nodes mocked)")
+    elif bugs_found > 0:
+        print(f"  [GRAPH OUTPUT] {bugs_found} verified vulnerabilities found & fixed in {focus_func}!")
+        print(f"  [GRAPH OUTPUT] Terminal state: {_classify_terminal_state(final_state)}")
+    else:
+        verdict = _classify_terminal_state(final_state)
+        tag = "SAFE" if "(UNSAT" in verdict or verdict.startswith("verified mathematically safe") else "NOT SAFE / INCOMPLETE"
+        print(f"  [GRAPH OUTPUT] {focus_func}: {verdict} [{tag}]")
+
+    for bug in final_state.get("verified_bugs", []):
+        results.append(build_finding(
+            bug["finding"],
+            final_state,
+            bug.get("fix_code", ""),
+            bug.get("poc_test_code", ""),
+            bug.get("forge_output", ""),
+            bug.get("qc_status", ""),
+        ))
 
 
 def run_pipeline_code(contract_code: str, readme: str = "") -> list:

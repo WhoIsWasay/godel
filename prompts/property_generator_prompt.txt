@@ -87,6 +87,7 @@
     <hard_constraints>
         <constraint>Never use placeholder variable names. Use the exact names from the contract.</constraint>
         <constraint>Never output prose or bullet-point analysis outside the scratchpad. The final artifact is code.</constraint>
+        <constraint><![CDATA[ The property script may ONLY import z3 (from z3 import *). Any other import (os, sys, subprocess, open, eval, etc.) is rejected before execution and never runs. ]]></constraint>
         <constraint>Never truncate the output. The code block must be complete and runnable.</constraint>
         <constraint>If the contract uses uint96 for balances and uint256 for totalSupply, model both types separately with their respective bounds.</constraint>
         <constraint>The negation of the property goes inside the solver, not as a comment.</constraint>
