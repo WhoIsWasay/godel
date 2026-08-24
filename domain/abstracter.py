@@ -79,6 +79,42 @@ def _first_top_level_arg(text: str) -> str:
     return text
 
 
+def _branch_context(node) -> list[dict]:
+    """Conditions governing execution AT this node, outermost-first.
+    Each entry: {'c': <source text>, 'loop': bool} — 'loop' marks conditions
+    of enclosing FOR/WHILE (IFLOOP) constructs, whose per-iteration semantics
+    the encoder cannot model (callers must havock loop-dependent effects).
+    Polarity is folded into the text: 'cond' via the true branch,
+    'not cond' via the false branch. [] = unconditional.
+
+    Walks the immediate-dominator chain; a node whose idom is an IF/IFLOOP
+    is tagged by which son it is (index 0 = true, index 1 = false). Join
+    nodes after a merge are NOT sons of the IF itself, so they walk past
+    untagged — exactly right (post-merge code is unconditional)."""
+    ctx: list[dict] = []
+    cur = node
+    seen = 0
+    while cur is not None and seen < 64:
+        seen += 1
+        parent = getattr(cur, "immediate_dominator", None)
+        if parent is None:
+            break
+        ptype = _ntype(parent)
+        if ptype in ("IF", "IFLOOP"):
+            try:
+                idx = list(parent.sons).index(cur)
+            except ValueError:
+                idx = -1
+            if idx in (0, 1):
+                cond = _trim(parent.expression, 160)
+                if cond:
+                    ctx.append({"c": ("not " if idx == 1 else "") + cond,
+                                "loop": ptype == "IFLOOP"})
+        cur = parent
+    ctx.reverse()
+    return ctx
+
+
 def _extract_function_facts(func) -> dict:
     """Pulls the CFG facts we care about from one slither Function object."""
     nodes = list(func.nodes)
@@ -113,6 +149,7 @@ def _extract_function_facts(func) -> dict:
     ev_count = 0
     for n in nodes:
         expr = str(n.expression) if n.expression else ""
+        when = _branch_context(n)
         for ir in n.irs or []:
             if isinstance(ir, (HighLevelCall, LowLevelCall, Send, Transfer)):
                 has_external_call = True
@@ -131,7 +168,8 @@ def _extract_function_facts(func) -> dict:
             if m and m.group(1) in ("require", "assert"):
                 arg = _first_top_level_arg(m.group(2))
                 if arg:
-                    guards.append({"text": _trim(arg, 200), "order": ev_count})
+                    guards.append({"text": _trim(arg, 200), "order": ev_count,
+                                   "when": when})
                     ev_count += 1
                 continue
             if _ntype(n) in ("EXPRESSION", "NEW VARIABLE", "VARIABLE"):
@@ -140,7 +178,8 @@ def _extract_function_facts(func) -> dict:
                     assignments.append({"op": am.group(2),
                                         "lhs": _trim(am.group(1), 80),
                                         "rhs": _trim(am.group(3), 140),
-                                        "order": ev_count})
+                                        "order": ev_count,
+                                        "when": when})
                     ev_count += 1
         except Exception:
             continue

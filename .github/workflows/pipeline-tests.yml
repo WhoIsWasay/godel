@@ -1,4 +1,4 @@
-﻿name: Pipeline Tests
+name: Pipeline Tests
 
 # LLM-free regression net: static analyzer, semantic encoder, invariant mode,
 # routing/verdict logic, Z3 sentinel matrix, and mocked Gatekeeper classification.
@@ -43,8 +43,11 @@ jobs:
       - name: Phase 3 â€” invariant-mode suite
         run: python -X utf8 testOfCode/test_phase3.py
 
-      - name: Phase 4 â€” routing / verdict / Z3 / Gatekeeper matrices
+      - name: Phase 4 - routing / verdict / Z3 / Gatekeeper matrices
         run: python -X utf8 testOfCode/test_phase4.py
+
+      - name: BitVec-256 wraparound probe
+        run: python -X utf8 testOfCode/test_wrap_probe.py
 
       # Contract-free e2e: synthetic contract generated at runtime, LLMs mocked.
       # (Sample .sol fixtures are intentionally NOT committed to the repo.)

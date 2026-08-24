@@ -83,6 +83,46 @@ def _doctor_impl() -> int:
     return 1 if crit_fail else 0
 
 
+def run_wrap_probe(args) -> int:
+    """Opt-in BitVec-256 wraparound triage over a contracts folder.
+    Deterministic, LLM-free. Conservative: guards are NOT assumed."""
+    from domain.config import CONTRACTS_FOLDER
+    from domain.abstracter import abstract_contract
+    from domain.wrap_probe import probe_contract
+
+    folder = args.contracts or CONTRACTS_FOLDER
+    if not folder or not os.path.isdir(folder):
+        print(f"Invalid contracts folder for --wrap-probe: {folder!r}")
+        return 1
+
+    sol_files = []
+    for root, _, files in os.walk(folder):
+        sol_files.extend(os.path.join(root, f) for f in sorted(files) if f.endswith(".sol"))
+    if not sol_files:
+        print(f"No .sol files found in {folder}")
+        return 1
+
+    total_wrappable = 0
+    for path in sol_files:
+        analysis = abstract_contract(path)
+        name = os.path.basename(path)
+        if analysis is None:
+            print(f"\n[{name}] static analysis unavailable — skipped (non-fatal)")
+            continue
+        rows = probe_contract(analysis)
+        wrappable = [r for r in rows if r["wrap_reachable"]]
+        total_wrappable += len(wrappable)
+        print(f"\n[{name}] contract={analysis['contract']}  "
+              f"arithmetic-writes={len(rows)}  WRAPPABLE={len(wrappable)}")
+        for r in rows:
+            mark = "WRAPPABLE " if r["wrap_reachable"] else "bounded/ok"
+            print(f"   [{mark:>10}] {r['function']}: {r['write']}")
+
+    print(f"\n=== WRAP PROBE RESULT: {total_wrappable} storage write(s) can "
+          "wrap in a single call (guards NOT assumed — triage list) ===")
+    return 0
+
+
 def run_invariant_mode(args) -> int:
     """Deterministic invariant-preservation checking over a contracts folder.
     No LLM calls: static analysis + Z3 only."""
@@ -172,10 +212,16 @@ def main():
                         help="Contract-wide invariant mode: check preservation of EXPR across all public "
                              "functions (deterministic, no LLM). Post-state keys use '@new', e.g. "
                              "\"total@new == bal[S]@new\"")
+    parser.add_argument("--wrap-probe", action="store_true",
+                        help="BitVec-256 wraparound triage: flag storage arithmetic that can overflow/underflow "
+                             "in a single call (deterministic, conservative — guards not assumed)")
     args = parser.parse_args()
 
     if args.doctor:
         return run_doctor()
+
+    if args.wrap_probe:
+        return run_wrap_probe(args)
 
     if args.invariant:
         return run_invariant_mode(args)
