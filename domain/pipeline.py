@@ -501,6 +501,8 @@ def _classify_terminal_state(final_state: dict) -> str:
     if (final_state.get("executor_runs", 0) >= config.EXECUTOR_MAX_ITERATIONS
             and res.get("status") in ("error", "inconclusive")):
         return f"aborted: executor exhausted retries on Z3 errors — inconclusive, NOT proven safe"
+    if final_state.get("vacuity_status") == "vacuous":
+        return f"vacuously safe (UNSAT but {final_state.get('vacuity_reason', 'model unreachable')}) — NOT a real proof"
     if res.get("status") == "unsat":
         # Honest labeling: the strength of the claim must reflect the strength
         # of the model that produced it.
@@ -659,7 +661,11 @@ def _collect_future_result(future, func_name: str, stem: str, results: list):
         print(f"  [GRAPH OUTPUT] Terminal state: {_classify_terminal_state(final_state)}")
     else:
         verdict = _classify_terminal_state(final_state)
-        tag = "SAFE" if "(UNSAT" in verdict or verdict.startswith("verified mathematically safe") else "NOT SAFE / INCOMPLETE"
+        is_genuine_safe = (
+            ("(UNSAT" in verdict or verdict.startswith("verified mathematically safe"))
+            and "vacuously" not in verdict
+        )
+        tag = "SAFE" if is_genuine_safe else "NOT SAFE / INCOMPLETE"
         print(f"  [GRAPH OUTPUT] {focus_func}: {verdict} [{tag}]")
 
     for bug in final_state.get("verified_bugs", []):

@@ -15,6 +15,8 @@ from domain.fixer import FixerAgent
 from domain.formatter import SubmissionFormatter
 from domain.schema import build_finding
 from domain.llm_utils import call_with_retry
+from domain.semantics import compose_reachability_script
+from domain.z3_runner import run_z3
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -240,7 +242,31 @@ def executor_node(state: GraphState, cegis_tool: CEGIS):
         updates["bug_report"] = f"[Z3] Counterexample found:\n{result['output']}{cex_txt}"
         updates["messages"] = [AIMessage(content="[EXECUTOR]: SAT. Counterexample found. Passing to Gatekeeper.")]
     elif result["status"] == "unsat":
-        updates["messages"] = [AIMessage(content="[EXECUTOR]: UNSAT. Property holds safely.")]
+        harness = state.get("semantic_harness")
+        if harness and harness.get("code"):
+            vac_script = compose_reachability_script(harness)
+            vac_result = run_z3(vac_script)
+            if vac_result.get("status") == "sat":
+                # Model satisfiable without property -> genuine proof
+                updates["messages"] = [AIMessage(content="[EXECUTOR]: UNSAT. Property holds safely.")]
+            elif vac_result.get("status") in ("unsat", "error", "inconclusive"):
+                # Model itself is unsatisfiable or could not be checked ->
+                # the UNSAT property result may be vacuous
+                reason = (
+                    "harness model is unsatisfiable (guards contradict bounds "
+                    "or transitions) — property holds vacuously, NOT a real proof"
+                    if vac_result.get("status") == "unsat"
+                    else f"vacuity probe inconclusive ({vac_result.get('error', 'unknown')})"
+                )
+                updates["vacuity_status"] = "vacuous"
+                updates["vacuity_reason"] = reason
+                print(f"      [VACUITY] {state.get('current_focus_function')}: {reason}")
+                updates["messages"] = [AIMessage(
+                    content=f"[EXECUTOR]: UNSAT but VACUOUS — {reason}")]
+            else:
+                updates["messages"] = [AIMessage(content="[EXECUTOR]: UNSAT. Property holds safely.")]
+        else:
+            updates["messages"] = [AIMessage(content="[EXECUTOR]: UNSAT. Property holds safely.")]
     else:
         updates["supervisor_critique"] = f"Z3 Syntax/Execution Error:\n{result['error']}"
         updates["messages"] = [AIMessage(content="[EXECUTOR]: ERROR during execution. Needs refinement.")]

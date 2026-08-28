@@ -154,6 +154,7 @@ class HarnessEncoder:
             self.decls.append(f"{zname} = Int('{zname}')")
             if bounded:
                 self.bounds.append(f"{zname} >= 0")
+                self.bounds.append(f"{zname} <= 2**256 - 1")
         return self.registry[friendly]
 
     def _scalar_pair(self, name: str):
@@ -433,12 +434,13 @@ class HarnessEncoder:
             "code": "\n".join(lines),
             "untranslated": untranslated[:20],
             "assumptions": [
-                "uint256 modeled as unbounded Int: overflow wraparound is NOT "
-                "simulated (values above 2**256-1 stay reachable in-model)",
-                "soundness direction: unbounded Int OVER-approximates uint256, "
-                "so UNSAT verdicts remain valid proofs; SAT coverage is "
-                "asymmetric â€” wrap-induced counterexamples at the 2**256 "
-                "boundary can be missed and need an explicit BitVec pass",
+                "uint256 modeled as bounded Int [0, 2**256-1]: individual "
+                "variables are capped, so Z3 can detect when arithmetic results "
+                "exceed the uint256 maximum (overflow bugs); modular wraparound "
+                "is NOT simulated -- use BitVec(256) wrap-probe for exact wrap semantics",
+                "soundness direction: bounded Int stays an OVER-approximation of "
+                "uint256 (intermediate arithmetic is unbounded), so UNSAT verdicts "
+                "remain valid proofs; SAT now also catches overflow at the boundary",
                 "integer division truncation exact only for non-negative operands",
                 "mapping slots modeled per concrete index seen in source",
             ],
@@ -456,6 +458,27 @@ def generate_harness(analysis: dict | None, focus_function: str) -> dict | None:
         logger.warning("[SEMANTICS] harness generation failed for %s (non-fatal): %s",
                        focus_function, e)
         return None
+
+
+def compose_reachability_script(harness: dict) -> str:
+    """Build a Z3 script that checks satisfiability of the harness model
+    (bounds + guards + transitions) without any property assertion.
+
+    SAT   = the model admits at least one valid execution (pre-state reachable)
+    UNSAT = the model is internally inconsistent (guards contradict bounds, or
+            transitions contradict guards) — any property trivially holds
+
+    Used by the executor node after a property UNSAT to distinguish genuine
+    proofs from vacuous ones."""
+    code = harness["code"]
+    return code + "\n" + (
+        "# === Vacuity probe: is the model satisfiable without any property? ===\n"
+        "solver_vac, V_vac = build_model()\n"
+        "if solver_vac.check() == sat:\n"
+        "    print(\"Property holds\")\n"
+        "else:\n"
+        "    print(\"BUG FOUND: model is vacuously unsatisfiable\")\n"
+    )
 
 
 def compose_script(harness: dict, property_code: str) -> str:

@@ -79,6 +79,12 @@ class GraphState(TypedDict):
     # (harness dict with 'code'/'quality'; None -> legacy LLM-only encoding)
     semantic_harness: Optional[dict]
     model_quality: Optional[str]
+
+    # Vacuity detection: set by executor_node when Z3 returns UNSAT but the
+    # harness model is itself unsatisfiable (guards contradict bounds, or
+    # transitions contradict guards). A vacuous UNSAT means nothing was proven.
+    vacuity_status: Optional[str]
+    vacuity_reason: Optional[str]
     
     
     poc_test_code : str

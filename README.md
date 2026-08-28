@@ -36,14 +36,19 @@ Gödel abandons traditional single-threaded regex auditing in favor of a multi-a
 
 ## 🔬 Model Fidelity & Soundness
 
-Gödel's Z3 models encode uint256 as **unbounded integers** — a deliberate
-*over*-approximation. The consequence is asymmetric, and we state it plainly:
+Gödel's Z3 models encode uint256 as **bounded integers [0, 2^256-1]** — a
+deliberate *over*-approximation (intermediate arithmetic is unbounded). The
+consequence is asymmetric, and we state it plainly:
 
 - **UNSAT verdicts are sound proofs.** If no integer solution exists in the
-  unbounded model, none exists in real uint256 either.
-- **Overflow wraparound is not simulated.** Bugs that only manifest at the
-  `2**256` boundary can be missed on the SAT side; they require an explicit
-  BitVec follow-up pass (roadmap).
+  bounded model, none exists in real uint256 either.
+- **Overflow is detected.** Individual variables are capped at `2**256 - 1`, so
+  Z3 can find counterexamples where arithmetic results exceed the uint256
+  maximum. Modular wraparound is still NOT simulated — use `--wrap-probe`
+  (BitVec-256) for exact wrap semantics.
+- **Vacuity is checked.** Every UNSAT verdict triggers a reachability probe that
+  verifies the function's pre-state is satisfiable. Vacuous results (where
+  guards contradict bounds) are labeled `NOT a real proof` in reporting.
 - Every harness carries a `model_quality` label (`FULL` / `PARTIAL`) and its
   verdicts are reported with that strength attached — aborts and inconclusive
   runs are never reported as "safe".
@@ -81,6 +86,9 @@ MCP integration for AI assistants: `python mcp_server.py` (see header of that fi
   * **RAG: batch embed + startup warmup.** The 3 query embeddings per finding now go out in a single Ollama HTTP call (`embed_batch()`) instead of 3 sequential round-trips. A `warmup_rag()` call at pipeline startup preloads the cross-encoder from HuggingFace and warms the Ollama 8b model into VRAM before any function graph spawns — eliminates the ~36s cold-start penalty that hit the first finding. Net: ~47s → ~8-10s per RAG call. Added to `Infrastructure/postgres.py`; wired into `domain/pipeline.py:run_pipeline()`.
   * **Verifier thinking budget 12k → 6k.** The verifier generates PoC exploit code that is deterministically re-validated by Z3 and the Foundry gatekeeper — a smaller thinking budget halves PoC generation time without introducing false verdicts. Same pattern as the fixer (already at 6k). Changed in `domain/pipeline.py:llm_pro`.
   * **Wave budget 900 → 1200s default.** The 900s flat budget killed multi-finding functions mid-flight (`repay`'s second finding and `redeem`'s fixer/report were cut by the timeout). The RAG + verifier savings free headroom; the higher default provides a safety margin so verified work isn't discarded. Still env-overridable via `GODEL_PER_FUNCTION_TIMEOUT`.
+* **Soundness pass (Aug 2026):** Closed two known soundness gaps that affected verdict trustworthiness:
+  * **Overflow bounds: uint256 capped at [0, 2^256-1].** All bounded `Int` variables in the Z3 harness now carry both a `>= 0` lower bound and a `<= 2**256 - 1` upper bound (previously unbounded above). UNSAT verdicts remain valid proofs (no counterexample in the bounded model = none in real uint256). SAT now also catches overflow bugs where arithmetic results exceed the uint256 maximum. Modular wraparound is still NOT simulated — use the existing `--wrap-probe` (BitVec-256) for exact wrap semantics. Changed in `domain/semantics.py:_reg()`.
+  * **Vacuity detection in main pipeline.** After every UNSAT verdict, the executor now runs a reachability probe (`compose_reachability_script()`) that checks whether the harness model is itself satisfiable (bounds + guards + transitions without any property assertion). If the model is unsatisfiable, the UNSAT property result is vacuous — the function's preconditions contradict each other, so any property trivially holds. Vacuous results are labeled `"vacuously safe — NOT a real proof"` and tagged `NOT SAFE / INCOMPLETE` in reporting, preventing false confidence. Previously only available in invariant mode (`--invariant`). Added to `domain/semantics.py`, `domain/graph_nodes.py`, `domain/state.py`, `domain/pipeline.py`.
 * **Concurrency & Thread Safety:** Upgraded `orchestrator.py` to handle 20+ parallel function graph threads simultaneously using dynamic file-naming locks in the gatekeeper sandbox.
 * **CEGIS Auto-Healing Loop:** Added autonomous compiler-error feedback loops to heal failing Foundry test files across multi-iteration runs.
 * **Red Herring Suppression:** Hardened Z3 path constraints to formally prove safety for bounded recursion, safe multi-variable unchecked math, and quantized rounding identities, eliminating alert fatigue.
