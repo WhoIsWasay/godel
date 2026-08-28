@@ -148,11 +148,18 @@ def warmup_rag():
 
     Eliminates the cold-start penalty that otherwise hits the first finding's
     RAG call: ~21.8s HuggingFace download + ~14s Ollama VRAM load. Called once
-    from run_pipeline() before any function graph spawns."""
+    from run_pipeline() before any function graph spawns. Non-fatal: if models
+    fail to load (e.g. CUDA OOM), the audit continues without RAG grounding."""
     t0 = time.time()
     _raglog("Warming up RAG models...")
-    _get_cross_encoder()
-    embed("warmup")
+    try:
+        _get_cross_encoder()
+    except Exception as e:
+        _raglog(f"Cross-encoder warmup failed (non-fatal): {e}")
+    try:
+        embed("warmup")
+    except Exception as e:
+        _raglog(f"Ollama embed warmup failed (non-fatal): {e}")
     _raglog(f"RAG warmup complete in {time.time()-t0:.1f}s")
 
 
