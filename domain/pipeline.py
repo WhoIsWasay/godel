@@ -65,12 +65,12 @@ llm_flash = ChatOpenAI(
 )
 
 llm_pro = ChatOpenAI(
-    model="deepseek-v4-pro",
+    model="deepseek-v4-flash",
     openai_api_key=os.environ.get("DEEPSEEK_API_KEY"),
-    temperature=0.2,
+    temperature=0.0,
     max_tokens=24000,
     openai_api_base="https://api.deepseek.com",
-    extra_body={"thinking": {"type": "enabled", "budget_tokens": 6000}},
+    extra_body={"thinking": {"type": "enabled", "budget_tokens": 16000}},
     timeout=120,
     max_retries=3,
 )
@@ -126,12 +126,12 @@ llm_repair = ChatOpenAI(
 # it is report content, not a verification gate. Cuts the slowest node on the
 # finding path from ~4 min to ~2 min without touching soundness.
 llm_fixer = ChatOpenAI(
-    model="deepseek-v4-pro",
+    model="deepseek-v4-flash",
     openai_api_key=os.environ.get("DEEPSEEK_API_KEY"),
-    temperature=0.2,
+    temperature=0.0,
     max_tokens=24000,
     openai_api_base="https://api.deepseek.com",
-    extra_body={"thinking": {"type": "enabled", "budget_tokens": 6000}},
+    extra_body={"thinking": {"type": "enabled", "budget_tokens": 16000}},
     timeout=120,
     max_retries=3,
 )
