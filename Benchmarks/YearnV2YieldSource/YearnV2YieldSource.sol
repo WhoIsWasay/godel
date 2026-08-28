@@ -1,14 +1,29 @@
 // SPDX-License-Identifier: GPL-3.0
 pragma solidity ^0.8.0;
 
-import "./interfaces/IYieldSource.sol";
-import "./interfaces/IYVaultV2.sol";
-
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
+
+interface IYieldSource {
+    function depositToken() external view returns (address);
+    function balanceOfToken(address addr) external returns (uint256);
+    function supplyTokenTo(uint256 amount, address to) external;
+    function redeemToken(uint256 amount) external returns (uint256);
+}
+
+interface IYVaultV2 is IERC20Upgradeable {
+    function token() external view returns (address);
+    function deposit() external returns (uint256);
+    function withdraw(uint256 maxShares) external returns (uint256);
+    function withdraw(uint256 maxShares, address recipient, uint256 maxLoss) external returns (uint256);
+    function pricePerShare() external view returns (uint256);
+    function decimals() external view returns (uint256);
+    function apiVersion() external view returns (string memory);
+    function activation() external view returns (uint256);
+}
 
 
 /// @title Yield source for a PoolTogether prize pool that generates yield by depositing into Yearn Vaults.

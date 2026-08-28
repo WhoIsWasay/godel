@@ -6,9 +6,35 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
-import "./interfaces/pooltogether/IProtocolYieldSource.sol";
-import "./interfaces/idle/IIdleToken.sol";
-import "./access/AssetManager.sol";
+import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
+
+interface IProtocolYieldSource {
+    function depositToken() external view returns (address);
+    function balanceOfToken(address addr) external view returns (uint256);
+    function supplyTokenTo(uint256 amount, address to) external;
+    function redeemToken(uint256 amount) external returns (uint256);
+    function sponsor(uint256 amount) external;
+    function transferERC20(address erc20Token, address to, uint256 amount) external;
+}
+
+interface IIdleToken is IERC20Upgradeable {
+    function token() external view returns (address);
+    function tokenPriceWithFee(address user) external view returns (uint256);
+    function mintIdleToken(uint256 amount, bool skipWholeAmount, address referral) external returns (uint256);
+    function redeemIdleToken(uint256 amount) external returns (uint256);
+}
+
+abstract contract AssetManager is OwnableUpgradeable {
+    address public assetManager;
+    modifier onlyOwnerOrAssetManager() {
+        require(msg.sender == owner() || msg.sender == assetManager, "AssetManager: caller is not owner or asset manager");
+        _;
+    }
+    function setAssetManager(address _assetManager) external onlyOwner {
+        assetManager = _assetManager;
+    }
+}
 
 /// @title An pooltogether yield source for Idle token
 /// @author Sunny Radadiya
