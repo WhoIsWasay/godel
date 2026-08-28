@@ -71,10 +71,27 @@ MCP integration for AI assistants: `python mcp_server.py` (see header of that fi
 
 ## 🛠️ What Changed in This Version (Changelog)
 
+* **Performance pass (Aug 2026):** Cut per-function wall time ~10-15x on finding-free paths and ~2-5x on confirmed-bug paths with zero accuracy loss (measured on the planted corpus + StablecoinCDP):
+  * **Supervisor demoted to a fast JSON-mode classifier.** Its routing verdict was never a soundness gate — Z3 and the EVM gatekeeper re-verify everything — so it no longer burns a 12k-thinking reasoner call on every finding-bearing function. Structured `response_format` output also eliminates the parse-failure re-invocation loop.
+  * **CEGIS Z3-script repair + Foundry PoC-heal moved to a fast model.** Both outputs are re-validated deterministically (Z3 re-run / solc compile) before acceptance, so a weaker drafter cannot introduce a false verdict.
+  * **Fixer thinking budget 12k → 6k.** Runs after a bug is Z3/forge-verified; it composes advisory remediation reports, not verdicts.
+  * **Default `MAX_WORKERS` 2 → 8** (override: `GODEL_MAX_WORKERS`) and default per-wave budget 600 → 900 s so multi-finding functions aren't killed mid-report.
+  * **Opt-in read-only fast path** (`GODEL_SKIP_READONLY=1`): functions Slither proves have no storage writes / external calls are skipped entirely — they cannot violate the state-transition invariants the Z3 harness models.
 * **Concurrency & Thread Safety:** Upgraded `orchestrator.py` to handle 20+ parallel function graph threads simultaneously using dynamic file-naming locks in the gatekeeper sandbox.
 * **CEGIS Auto-Healing Loop:** Added autonomous compiler-error feedback loops to heal failing Foundry test files across multi-iteration runs.
 * **Red Herring Suppression:** Hardened Z3 path constraints to formally prove safety for bounded recursion, safe multi-variable unchecked math, and quantized rounding identities, eliminating alert fatigue.
 * **Hardening pass (Aug 2026):** ElementTree-based XML extraction (fixes silent function-body truncation), AST safety gate for generated scripts, structured `forge --json` gatekeeper verdicts, worker-aware batch timeouts, absolute-path enforcement around the Slither chdir window, committed benchmark evidence ([docs/BENCHMARKS.md](docs/BENCHMARKS.md)).
+
+### ⚡ Runtime Tuning Knobs
+
+| Env var | Default | Effect |
+|---|---|---|
+| `GODEL_MAX_WORKERS` | `8` | Parallel function-graph threads per contract |
+| `GODEL_ISOLATOR_MODEL` | *(unset → reasoning model)* | Fast model for the bug-hunter/isolator; every proposal is machine-verified downstream, so a fast model is safe (`deepseek-v4-flash`) |
+| `GODEL_SKIP_READONLY` | `0` | `1` skips Slither-proven read-only functions (no state writes / external calls) — trades view-logic coverage for speed |
+| `GODEL_PER_FUNCTION_TIMEOUT` | `900` | Per-wave wall-clock budget in seconds |
+| `GODEL_EXECUTOR_MAX_ITERATIONS` | `4` | Bounds the Z3 property refinement loop |
+| `GODEL_SUPERVISOR_MAX_ITERATIONS` | `3` | Bounds the supervisor critique loop |
 
 ---
 Built By Wasay. August 2026.

@@ -62,3 +62,31 @@ See "Model Fidelity & Soundness" in the README: uint256 is modeled as
 unbounded integers (UNSAT proofs remain sound; wraparound-induced bugs need a
 future BitVec pass), branches degrade models to `PARTIAL`, and mapping slots
 are modeled per concrete index observed in source.
+
+## 6. Performance evidence (Aug 2026 pass)
+
+Deterministic stage timings (single machine, no LLM calls):
+
+| Stage | Measured |
+|---|---|
+| `parse_solidity_to_xml` | 1–5 ms/file |
+| Slither abstraction (incl. all detectors, cold) | 104–392 ms/file, cached after |
+| Z3 harness encoding | 0.1–0.5 ms/function |
+| Z3 solve (typical harness) | ~1 ms (+~110 ms subprocess spawn) |
+| `forge build` warm + test | ~0.5–1.4 s |
+| Full dry-run e2e (8-function contract, LLMs mocked) | 17.7 s |
+
+End-to-end after the performance pass (LLM calls live):
+
+| Path | Measured |
+|---|---|
+| Bug-free function | ~1–2 s |
+| Confirmed-bug full cycle (hunter → supervisor → Z3 → forge → fixer) | ~3 min |
+| `StandardYieldVault` (VulunT, 3 planted bugs) | 3/3 confirmed in ~11 min, 0 FP |
+| `StablecoinCDP` (this repo's benchmark contract) | `borrow` fee-truncation + `redeemExactCollateral` floor-division share-burn re-confirmed via Z3 SAT + `forge --json`, 0 FP |
+
+Residual cost drivers on finding paths (not the deterministic stack): a RAG
+round-trip (~47 s with a cold cross-encoder/embed model) and reasoning-model
+verifier PoC generation (2–5 min per confirmed bug). These dominate wall time
+on buggy functions and are the next optimization target before the
+compositional (multi-contract parallel) pass.

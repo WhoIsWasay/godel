@@ -90,13 +90,58 @@ llm_isolator = (
     if config.ISOLATOR_MODEL else llm_pro
 )
 
+# Supervisor: a cheap JSON classifier whose routing verdict is ALWAYS
+# re-verified by the Z3 solver and the Foundry gatekeeper downstream. A fast
+# model with thinking off + structured JSON output is sufficient; this turns a
+# multi-minute reasoner call into seconds for every finding-bearing function.
+llm_supervisor = ChatOpenAI(
+    model="deepseek-v4-flash",
+    openai_api_key=os.environ.get("DEEPSEEK_API_KEY"),
+    temperature=0.0,
+    max_tokens=1200,
+    openai_api_base="https://api.deepseek.com",
+    extra_body={"thinking": {"type": "disabled"}},
+    model_kwargs={"response_format": {"type": "json_object"}},
+    timeout=120,
+    max_retries=3,
+)
+
+# Repair/heal agent: fixes Z3 scripts and Foundry test suites whose errors are
+# deterministically re-validated (Z3 re-run / solc compile) before anything is
+# accepted — a fast model is sufficient for these mechanical repairs.
+llm_repair = ChatOpenAI(
+    model="deepseek-v4-flash",
+    openai_api_key=os.environ.get("DEEPSEEK_API_KEY"),
+    temperature=0.0,
+    max_tokens=24000,
+    openai_api_base="https://api.deepseek.com",
+    extra_body={"thinking": {"type": "disabled"}},
+    timeout=120,
+    max_retries=3,
+)
+
+# Fixer: still a reasoning model (remediation-patch quality matters) but with a
+# halved thinking budget — the fix runs AFTER the bug is Z3/forge-verified, so
+# it is report content, not a verification gate. Cuts the slowest node on the
+# finding path from ~4 min to ~2 min without touching soundness.
+llm_fixer = ChatOpenAI(
+    model="deepseek-v4-pro",
+    openai_api_key=os.environ.get("DEEPSEEK_API_KEY"),
+    temperature=0.2,
+    max_tokens=24000,
+    openai_api_base="https://api.deepseek.com",
+    extra_body={"thinking": {"type": "enabled", "budget_tokens": 6000}},
+    timeout=120,
+    max_retries=3,
+)
+
 inspector = Inspector(llm_isolator, llm_pro)
 generator = PropertyGenerator(agent=llm_flash)
-property_verifier = PropertyVerifierAgent(agent_llm=llm_pro)
+property_verifier = PropertyVerifierAgent(agent_llm=llm_pro, heal_llm=llm_repair)
 gatekeeper = FoundryGatekeeper(project_root=str(config.FOUNDRY_ROOT), verifier_agent=property_verifier)
-fixer = FixerAgent(agent=llm_pro)
+fixer = FixerAgent(agent=llm_fixer)
 formatter = SubmissionFormatter()
-cegis = CEGIS(agent=llm_pro, run_z3_tool=run_z3)
+cegis = CEGIS(agent=llm_repair, run_z3_tool=run_z3)
 
 
 # ==========================================
@@ -202,6 +247,29 @@ def batch_timeout_for(n_functions: int) -> float:
     return config.PER_FUNCTION_TIMEOUT * waves
 
 
+def is_read_only_function(analysis: dict | None, func_name: str) -> bool:
+    """Deterministic fast-path predicate: True when the Slither abstraction
+    shows the function cannot write storage, cannot call out, and is not
+    payable — i.e. it cannot violate any storage-transition invariant the Z3
+    harness models. Returns False whenever the analysis is unavailable or the
+    function cannot be matched, so coverage only ever shrinks when we KNOW."""
+    if not analysis:
+        return False
+    functions = analysis.get("functions", {})
+    key = next(
+        (k for k in functions if k.split("(", 1)[0] == func_name.split("(", 1)[0]),
+        None,
+    )
+    if key is None:
+        return False
+    f = functions[key]
+    return (
+        not f.get("state_writes")
+        and not f.get("has_external_call")
+        and not f.get("payable")
+    )
+
+
 def process_function(func, raw_solidity_code, stem, readme, env_setup, interfaces, state_vars, app,
                      static_analysis=None):
     print(f"  -> Spawning Graph Thread for [{func['name']}]...")
@@ -264,7 +332,7 @@ def process_function(func, raw_solidity_code, stem, readme, env_setup, interface
 # ==========================================
 # NODE WRAPPERS
 # ==========================================
-def node_supervisor(state: GraphState): return supervisor_node(state, llm_pro)
+def node_supervisor(state: GraphState): return supervisor_node(state, llm_supervisor)
 
 
 def node_bug_hunter(state: GraphState):
@@ -509,6 +577,18 @@ def run_pipeline(contract_folder: str = None) -> list:
         functions = extract_functions_from_xml(xml_str)
 
         print(f"\nProcessing File: {sol_path} ({len(functions)} valid execution functions identified)")
+
+        if config.SKIP_READONLY_FUNCTIONS:
+            kept, skipped = [], []
+            for func in functions:
+                if is_read_only_function(static_analysis, func["name"]):
+                    skipped.append(func["name"])
+                else:
+                    kept.append(func)
+            if skipped:
+                print(f"      [FAST PATH] skipped {len(skipped)} read-only function(s) "
+                      f"(no state writes / no external calls): {', '.join(skipped)}")
+            functions = kept
 
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=config.MAX_WORKERS)
         future_to_func = {

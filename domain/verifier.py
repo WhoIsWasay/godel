@@ -14,8 +14,9 @@ from domain.llm_utils import call_with_retry
 #             import "src/{contract_filename}";
 #         </law>
 class PropertyVerifierAgent:
-    def __init__(self, agent_llm):
+    def __init__(self, agent_llm, heal_llm=None):
         self.llm = agent_llm
+        self.heal_llm = heal_llm or agent_llm
         self.prompt_template = ChatPromptTemplate.from_messages([
            ("system", """<verification_engineer_directive>
     <role_definition>
@@ -135,7 +136,7 @@ COMPILER ERROR:
 {error_log}
 
 Review the original target contract interface, correct the syntax/arguments according to the exact error, and return ONLY the corrected raw Solidity code inside markdown fences."""
-        response = call_with_retry(lambda: self.llm.invoke(feedback_prompt))
+        response = call_with_retry(lambda: self.heal_llm.invoke(feedback_prompt))
         return self._clean_markdown(response.content.strip())
 
     def _clean_markdown(self, content: str) -> str:

@@ -84,8 +84,15 @@ HUNTER_MAX_PARSE_RETRIES   = _env_int("GODEL_HUNTER_PARSE_RETRIES", 2)
 # ==========================================
 # TIMEOUTS
 # ==========================================
-PER_FUNCTION_TIMEOUT = _env_float("GODEL_PER_FUNCTION_TIMEOUT", 600.0)
-MAX_WORKERS          = _env_int("GODEL_MAX_WORKERS", 2)
+PER_FUNCTION_TIMEOUT = _env_float("GODEL_PER_FUNCTION_TIMEOUT", 900.0)
+MAX_WORKERS          = _env_int("GODEL_MAX_WORKERS", 8)
+
+# Opt-in read-only fast path (default OFF so default coverage is unchanged).
+# When enabled, functions with no storage writes, no external calls and not
+# payable are skipped entirely (they cannot violate the state-transition
+# invariants the Z3 harness models). Tradeoff: view/pure logic bugs are no
+# longer audited.
+SKIP_READONLY_FUNCTIONS = os.environ.get("GODEL_SKIP_READONLY", "0") in ("1", "true", "True")
 
 # Tool timeouts (previously hardcoded in z3_runner.py / gatekeeper.py)
 Z3_TIMEOUT_SECONDS   = _env_float("GODEL_Z3_TIMEOUT", 30.0)
