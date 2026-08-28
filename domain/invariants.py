@@ -256,6 +256,26 @@ def check_function(analysis: dict, function_name: str, invariant: str,
     return out
 
 
+def _canonicalize_slots(invariant: str, state_vars: set[str]) -> str:
+    """Normalizes author slot syntax to model keys:
+       msg.sender -> S ; any other index on a known state mapping -> '#'
+    e.g. 'epochSpent[epochId]@new <= epochSpent[epochId]'
+      -> 'epochSpent[#]@new <= epochSpent[#]'
+    Exact source-seen slots (like bal[S]) still win because _wrap_keys runs
+    longest-match over the harness registry AFTER canonicalization only if
+    the exact key exists; generic keys are the fallback."""
+    out = invariant.replace("msg.sender", "S")
+    def repl(m):
+        base, idx, suffix = m.group(1), m.group(2).strip(), m.group(3) or ""
+        if base not in state_vars:
+            return m.group(0)
+        if idx == "S":
+            return f"{base}[S]{suffix}"
+        return f"{base}[#]{suffix}"
+    import re as _re
+    return _re.sub(r"\b([A-Za-z_][A-Za-z0-9_]*)\[([^\]\[@]+)\](@new)?", repl, out)
+
+
 def check_invariant_preservation(analysis: dict, invariant: str,
                                  functions: list[str] = None) -> dict:
     """Checks an invariant across all (or selected) functions of a contract.
@@ -265,6 +285,8 @@ def check_invariant_preservation(analysis: dict, invariant: str,
         raise ValueError("no static analysis available")
 
     all_fns = list(analysis.get("functions", {}).keys())
+    state_vars = {v["name"] for v in analysis.get("storage_layout", [])}
+    invariant = _canonicalize_slots(invariant, state_vars)
 
     # Union of every symbol key across all function models — the invariant
     # must reference at least one known state symbol somewhere.

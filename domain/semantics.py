@@ -242,8 +242,16 @@ class HarnessEncoder:
         # ---- ALL storage variables registered upfront (old/new pairs) so
         # invariants and guards can reference state this function never
         # touches; untouched vars stay unconstrained unless constrained above.
+        st_types = {v["name"]: str(v.get("type", "")) for v in self.analysis.get("storage_layout", [])}
         for sv in sorted(self.state_vars):
             self._scalar_pair(sv)
+            # Generic (quantified) slot for mappings: lets invariant authors
+            # write M[x] for arbitrary x. Free by default = sound havoc;
+            # invariant-mode pins new==old when the function cannot write it.
+            if "mapping" in st_types.get(sv, ""):
+                zn = f"{_san(sv)}__GEN"
+                self._reg(f"{sv}[#]", zn)
+                self._reg(f"{sv}[#]@new", zn + "_new")
 
         valid_names = set(self.registry.values())
 
