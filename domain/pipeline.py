@@ -402,6 +402,8 @@ def route_after_executor(state: GraphState) -> str:
         return "specifier"
     elif status == "sat":
         return "gatekeeper"
+    if state.get("findings"):
+        return "specifier"
     return END
 
 

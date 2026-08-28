@@ -242,6 +242,8 @@ def executor_node(state: GraphState, cegis_tool: CEGIS):
         updates["bug_report"] = f"[Z3] Counterexample found:\n{result['output']}{cex_txt}"
         updates["messages"] = [AIMessage(content="[EXECUTOR]: SAT. Counterexample found. Passing to Gatekeeper.")]
     elif result["status"] == "unsat":
+        remaining = state.get("findings", []) or []
+        updates["findings"] = remaining[1:] if remaining else []
         harness = state.get("semantic_harness")
         if harness and harness.get("code"):
             vac_script = compose_reachability_script(harness)
