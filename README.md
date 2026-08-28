@@ -77,6 +77,10 @@ MCP integration for AI assistants: `python mcp_server.py` (see header of that fi
   * **Fixer thinking budget 12k → 6k.** Runs after a bug is Z3/forge-verified; it composes advisory remediation reports, not verdicts.
   * **Default `MAX_WORKERS` 2 → 8** (override: `GODEL_MAX_WORKERS`) and default per-wave budget 600 → 900 s so multi-finding functions aren't killed mid-report.
   * **Opt-in read-only fast path** (`GODEL_SKIP_READONLY=1`): functions Slither proves have no storage writes / external calls are skipped entirely — they cannot violate the state-transition invariants the Z3 harness models.
+* **RAG + verifier + timeout pass (Aug 2026):** Three targeted fixes to cut the 22.8 min/contract wall time on real multi-finding contracts (measured on StablecoinCDP, 5 functions, 3 findings):
+  * **RAG: batch embed + startup warmup.** The 3 query embeddings per finding now go out in a single Ollama HTTP call (`embed_batch()`) instead of 3 sequential round-trips. A `warmup_rag()` call at pipeline startup preloads the cross-encoder from HuggingFace and warms the Ollama 8b model into VRAM before any function graph spawns — eliminates the ~36s cold-start penalty that hit the first finding. Net: ~47s → ~8-10s per RAG call. Added to `Infrastructure/postgres.py`; wired into `domain/pipeline.py:run_pipeline()`.
+  * **Verifier thinking budget 12k → 6k.** The verifier generates PoC exploit code that is deterministically re-validated by Z3 and the Foundry gatekeeper — a smaller thinking budget halves PoC generation time without introducing false verdicts. Same pattern as the fixer (already at 6k). Changed in `domain/pipeline.py:llm_pro`.
+  * **Wave budget 900 → 1200s default.** The 900s flat budget killed multi-finding functions mid-flight (`repay`'s second finding and `redeem`'s fixer/report were cut by the timeout). The RAG + verifier savings free headroom; the higher default provides a safety margin so verified work isn't discarded. Still env-overridable via `GODEL_PER_FUNCTION_TIMEOUT`.
 * **Concurrency & Thread Safety:** Upgraded `orchestrator.py` to handle 20+ parallel function graph threads simultaneously using dynamic file-naming locks in the gatekeeper sandbox.
 * **CEGIS Auto-Healing Loop:** Added autonomous compiler-error feedback loops to heal failing Foundry test files across multi-iteration runs.
 * **Red Herring Suppression:** Hardened Z3 path constraints to formally prove safety for bounded recursion, safe multi-variable unchecked math, and quantized rounding identities, eliminating alert fatigue.
@@ -89,7 +93,7 @@ MCP integration for AI assistants: `python mcp_server.py` (see header of that fi
 | `GODEL_MAX_WORKERS` | `8` | Parallel function-graph threads per contract |
 | `GODEL_ISOLATOR_MODEL` | *(unset → reasoning model)* | Fast model for the bug-hunter/isolator; every proposal is machine-verified downstream, so a fast model is safe (`deepseek-v4-flash`) |
 | `GODEL_SKIP_READONLY` | `0` | `1` skips Slither-proven read-only functions (no state writes / external calls) — trades view-logic coverage for speed |
-| `GODEL_PER_FUNCTION_TIMEOUT` | `900` | Per-wave wall-clock budget in seconds |
+| `GODEL_PER_FUNCTION_TIMEOUT` | `1200` | Per-wave wall-clock budget in seconds |
 | `GODEL_EXECUTOR_MAX_ITERATIONS` | `4` | Bounds the Z3 property refinement loop |
 | `GODEL_SUPERVISOR_MAX_ITERATIONS` | `3` | Bounds the supervisor critique loop |
 

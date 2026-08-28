@@ -1,3 +1,4 @@
+
 import httpx
 import psycopg2
 import psycopg2.extras
@@ -84,6 +85,37 @@ def embed(text: str) -> list[float]:
     return vec
 
 
+def embed_batch(texts: list[str]) -> list[list[float]]:
+    """Embed multiple texts in a single Ollama HTTP call.
+
+    Ollama's /api/embed accepts a list for 'input' and returns all vectors in
+    one response — eliminates per-query round-trip overhead (~2-14s each)."""
+    if not texts:
+        return []
+    t0 = time.time()
+    try:
+        response = httpx.post(OLLAMA_URL, json={
+            "model": EMBED_MODEL,
+            "input": texts,
+        }, timeout=180)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        raise RuntimeError(f"Ollama embed_batch failed with HTTP {e.response.status_code}: "
+                           f"{e.response.text[:300]}") from e
+    except httpx.HTTPError as e:
+        raise RuntimeError(f"Ollama embed_batch request failed: {e}") from e
+
+    payload = response.json()
+    if not isinstance(payload, dict) or not payload.get("embeddings"):
+        raise RuntimeError(f"Unexpected embed_batch response from Ollama: {str(payload)[:300]}")
+    embeddings = payload["embeddings"]
+    if len(embeddings) != len(texts):
+        raise RuntimeError(f"Ollama returned {len(embeddings)} embeddings for {len(texts)} inputs")
+    result = [vec[:EMBED_DIM] for vec in embeddings]
+    _raglog(f"embed_batch({len(texts)} texts) -> dim={len(result[0])} in {time.time()-t0:.1f}s")
+    return result
+
+
 def vector_search(conn, embedding: list[float], top_k: int = 10) -> list[dict]:
     vec_str = "[" + ",".join(str(x) for x in embedding) + "]"
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -112,6 +144,19 @@ def vector_search(conn, embedding: list[float], top_k: int = 10) -> list[dict]:
     return rows
 
 
+def warmup_rag():
+    """Preload cross-encoder and Ollama embed model at startup.
+
+    Eliminates the cold-start penalty that otherwise hits the first finding's
+    RAG call: ~21.8s HuggingFace download + ~14s Ollama VRAM load. Called once
+    from run_pipeline() before any function graph spawns."""
+    t0 = time.time()
+    _raglog("Warming up RAG models...")
+    _get_cross_encoder()
+    embed("warmup")
+    _raglog(f"RAG warmup complete in {time.time()-t0:.1f}s")
+
+
 def retrieve(queries: list[str], top_k_per_query: int = 10, final_top_k: int = 5) -> list[dict]:
     """Multi-query vector search + cross-encoder rerank with full terminal logging."""
     t0_total = time.time()
@@ -122,12 +167,13 @@ def retrieve(queries: list[str], top_k_per_query: int = 10, final_top_k: int = 5
 
     conn = psycopg2.connect(**DB_CONFIG)
     try:
-        # 1. Embed + vector search each query
+        # 1. Batch-embed all queries in one Ollama call, then vector search each
+        t0 = time.time()
+        embeddings = embed_batch(queries)
+        _raglog(f"All {len(queries)} queries embedded in {time.time()-t0:.1f}s — vector search...")
+
         candidates = {}
-        for qi, query in enumerate(queries, 1):
-            t0 = time.time()
-            embedding = embed(query)
-            _raglog(f"Q{qi} embedded in {time.time()-t0:.1f}s — vector search...")
+        for qi, (query, embedding) in enumerate(zip(queries, embeddings), 1):
             results = vector_search(conn, embedding, top_k=top_k_per_query)
             new = 0
             for row in results:

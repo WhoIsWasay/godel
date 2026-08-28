@@ -84,7 +84,7 @@ HUNTER_MAX_PARSE_RETRIES   = _env_int("GODEL_HUNTER_PARSE_RETRIES", 2)
 # ==========================================
 # TIMEOUTS
 # ==========================================
-PER_FUNCTION_TIMEOUT = _env_float("GODEL_PER_FUNCTION_TIMEOUT", 900.0)
+PER_FUNCTION_TIMEOUT = _env_float("GODEL_PER_FUNCTION_TIMEOUT", 1200.0)
 MAX_WORKERS          = _env_int("GODEL_MAX_WORKERS", 8)
 
 # Opt-in read-only fast path (default OFF so default coverage is unchanged).

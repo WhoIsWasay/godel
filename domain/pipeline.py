@@ -35,6 +35,7 @@ from domain.graph_nodes import (
 )
 from domain.z3_runner import run_z3
 from domain.schema import build_finding
+from Infrastructure.postgres import warmup_rag
 
 sys.stdout.reconfigure(encoding='utf-8')
 load_dotenv(config.PROJECT_ROOT / ".env")
@@ -69,7 +70,7 @@ llm_pro = ChatOpenAI(
     temperature=0.2,
     max_tokens=24000,
     openai_api_base="https://api.deepseek.com",
-    extra_body={"thinking": {"type": "enabled", "budget_tokens": 12000}},
+    extra_body={"thinking": {"type": "enabled", "budget_tokens": 6000}},
     timeout=120,
     max_retries=3,
 )
@@ -537,6 +538,9 @@ def run_pipeline(contract_folder: str = None) -> list:
         return []
 
     app = build_godel_graph()
+
+    if not config.is_dry_run():
+        warmup_rag()
 
     print("\n" + "=" * 50)
     print("=== STARTING GÖDEL MULTI-AGENT ORCHESTRATOR ===")
