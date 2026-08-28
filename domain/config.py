@@ -80,6 +80,7 @@ SUPERVISOR_MAX_ITERATIONS = _env_int("GODEL_SUPERVISOR_MAX_ITERATIONS", 3)
 EXECUTOR_MAX_ITERATIONS    = _env_int("GODEL_EXECUTOR_MAX_ITERATIONS", 4)
 GATEKEEPER_MAX_RETRIES     = _env_int("GODEL_GATEKEEPER_MAX_RETRIES", 3)
 HUNTER_MAX_PARSE_RETRIES   = _env_int("GODEL_HUNTER_PARSE_RETRIES", 2)
+FUNCTION_MAX_RETRIES       = _env_int("GODEL_FUNCTION_MAX_RETRIES", 2)
 
 # ==========================================
 # TIMEOUTS
@@ -101,8 +102,8 @@ FORGE_TIMEOUT_SECONDS = _env_float("GODEL_FORGE_TIMEOUT", 45.0)
 # ==========================================
 # LLM RETRY
 # ==========================================
-LLM_RETRY_ATTEMPTS = _env_int("GODEL_LLM_RETRY_ATTEMPTS", 3)
-LLM_RETRY_BACKOFF  = _env_float("GODEL_LLM_RETRY_BACKOFF", 2.0)
+LLM_RETRY_ATTEMPTS = _env_int("GODEL_LLM_RETRY_ATTEMPTS", 5)
+LLM_RETRY_BACKOFF  = _env_float("GODEL_LLM_RETRY_BACKOFF", 3.0)
 
 # Isolator pass model override. The Isolator runs 3x per contract and is pure
 # candidate generation (every proposal is machine-verified downstream), so a

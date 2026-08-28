@@ -323,6 +323,8 @@ def retrieve_findings_for_hunter(function_name: str,
             "severity": r.get("severity") or "",
             "description": r.get("description") or "",
             "code_snippet": r.get("code_snippet") or "",
+            "rerank_score": r.get("rerank_score"),
+            "cosine_score": r.get("score"),
         })
 
     diagnostics = {

@@ -102,15 +102,27 @@ def bug_hunter_node(state: GraphState, inspector: Inspector):
         )
         if rag_findings:
             lines = []
+            mandatory_lines = []
             for rf in rag_findings:
                 sev = rf.get("severity", "?").upper()
                 title = rf.get("title_normalized", "")
                 desc = rf.get("description", "")[:300]
-                lines.append(f"- [{sev}] {title}: {desc}")
+                sim = rf.get("cosine_score") or rf.get("rerank_score") or 0.0
+                entry = f"- [{sev}] {title}: {desc}"
+                if sim >= 0.6:
+                    mandatory_lines.append(f"- [MANDATORY INVESTIGATE] [{sev}] {title}: {desc}")
+                else:
+                    lines.append(entry)
             rag_context = "\n\n=== KNOWN VULNERABILITY PATTERNS (from historical audits) ===\n"
-            rag_context += "These are REAL vulnerabilities found in similar contracts. "
-            rag_context += "Check if ANY apply to the current function:\n"
-            rag_context += "\n".join(lines)
+            if mandatory_lines:
+                rag_context += "The following patterns have HIGH RELEVANCE to this function. "
+                rag_context += "You MUST flag each as a finding — the Z3 solver will verify. "
+                rag_context += "Do NOT dismiss them:\n"
+                rag_context += "\n".join(mandatory_lines)
+                rag_context += "\n"
+            if lines:
+                rag_context += "\nAdditional patterns to CHECK:\n"
+                rag_context += "\n".join(lines)
     except Exception as e:
         print(f"      [RAG WARNING] hunter RAG retrieval failed (non-fatal): {e}")
     

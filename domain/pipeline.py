@@ -61,7 +61,7 @@ llm_flash = ChatOpenAI(
     openai_api_base="https://api.deepseek.com",
     extra_body={"thinking": {"type": "disabled"}},
     timeout=120,
-    max_retries=3,
+    max_retries=5,
 )
 
 llm_pro = ChatOpenAI(
@@ -72,7 +72,7 @@ llm_pro = ChatOpenAI(
     openai_api_base="https://api.deepseek.com",
     extra_body={"thinking": {"type": "enabled", "budget_tokens": 16000}},
     timeout=120,
-    max_retries=3,
+    max_retries=5,
 )
 
 # Isolator client: overridable to a fast model (GODEL_ISOLATOR_MODEL) since
@@ -86,7 +86,7 @@ llm_isolator = (
         openai_api_base="https://api.deepseek.com",
         extra_body={"thinking": {"type": "disabled"}},
         timeout=120,
-        max_retries=3,
+        max_retries=5,
     )
     if config.ISOLATOR_MODEL else llm_pro
 )
@@ -104,7 +104,7 @@ llm_supervisor = ChatOpenAI(
     extra_body={"thinking": {"type": "disabled"}},
     model_kwargs={"response_format": {"type": "json_object"}},
     timeout=120,
-    max_retries=3,
+    max_retries=5,
 )
 
 # Repair/heal agent: fixes Z3 scripts and Foundry test suites whose errors are
@@ -118,7 +118,7 @@ llm_repair = ChatOpenAI(
     openai_api_base="https://api.deepseek.com",
     extra_body={"thinking": {"type": "disabled"}},
     timeout=120,
-    max_retries=3,
+    max_retries=5,
 )
 
 # Fixer: still a reasoning model (remediation-patch quality matters) but with a
@@ -133,7 +133,7 @@ llm_fixer = ChatOpenAI(
     openai_api_base="https://api.deepseek.com",
     extra_body={"thinking": {"type": "enabled", "budget_tokens": 16000}},
     timeout=120,
-    max_retries=3,
+    max_retries=5,
 )
 
 inspector = Inspector(llm_isolator, llm_pro)
@@ -272,6 +272,31 @@ def is_read_only_function(analysis: dict | None, func_name: str) -> bool:
 
 
 def process_function(func, raw_solidity_code, stem, readme, env_setup, interfaces, state_vars, app,
+                     static_analysis=None):
+    import time as _time
+    func_name = func['name']
+    max_function_retries = config.FUNCTION_MAX_RETRIES
+    for attempt in range(max_function_retries + 1):
+        try:
+            return _process_function_inner(func, raw_solidity_code, stem, readme, env_setup,
+                                           interfaces, state_vars, app, static_analysis)
+        except Exception as exc:
+            exc_text = str(exc).lower()
+            is_transient = any(marker in exc_text for marker in (
+                "connection", "getaddrinfo", "timeout", "timed out",
+                "connectionerror", "connecterror", "reset by peer",
+            ))
+            if is_transient and attempt < max_function_retries:
+                delay = 5.0 * (attempt + 1)
+                print(f"      [FUNCTION RETRY] {func_name} failed with transient error "
+                      f"({type(exc).__name__}). Retrying in {delay}s "
+                      f"(attempt {attempt + 1}/{max_function_retries})...")
+                _time.sleep(delay)
+                continue
+            raise
+
+
+def _process_function_inner(func, raw_solidity_code, stem, readme, env_setup, interfaces, state_vars, app,
                      static_analysis=None):
     print(f"  -> Spawning Graph Thread for [{func['name']}]...")
 

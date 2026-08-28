@@ -33,6 +33,42 @@
             Read each finding. Extract the failure mode it encodes — the specific condition under which the invariant broke. These are your edge cases. Every finding that is relevant must produce at least one constraint or edge case in your Z3 model.
         </step>
 
+        <step number="2.5" title="IDENTIFY STATE PRECONDITIONS (CRITICAL)">
+            For EVERY finding from step 2, you MUST answer these questions before generating any Z3 code:
+
+            Q1: "What contract state must be true for this bug to trigger?"
+                - A floor-division bug only matters when the denominator is disproportionately large relative to the numerator.
+                - A ratio calculation bug only triggers when one side of the ratio has been inflated/deflated by external action.
+                - An underflow only occurs when a variable has been mutated into an unexpected range.
+
+            Q2: "What adversary action or sequence of events can create that state?"
+                - Direct token donation to the contract (inflates balance without minting shares)
+                - Flash loan that temporarily inflates/deflates a balance
+                - First-depositor attack (totalSupply is very small relative to deposited assets)
+                - Fee accrual or yield accumulation that inflates one side of a ratio
+                - Time passage that changes a rate or accumulator
+
+            Q3: "What is the MINIMUM Z3 constraint that encodes this adversarial state?"
+                - You MUST include the precondition in your solver. A property that checks `amount > 0 => shares > 0` is USELESS if the real bug only triggers when `totalAssets > totalSupply * 1000`. You MUST add that precondition.
+
+            ENCODING RULE: Every Z3 property MUST include at least one state precondition constraint.
+            Template: `s.add(precondition_constraint)  # adversarial state that triggers the bug`
+
+            EXAMPLE (donation attack on share minting):
+                Finding: "floor division in share calculation can mint zero shares"
+                Precondition: totalAssets is disproportionately large relative to totalSupply
+                Z3 encoding: `s.add(UGT(totalAssets, UMul(totalSupply, BitVecVal(100, 256))))  # donation inflated assets`
+                Then check: `s.add(And(UGT(depositAmount, 0), shares == 0))`
+
+            EXAMPLE (ratio manipulation):
+                Finding: "reward calculation uses stale denominator"
+                Precondition: denominator was updated BEFORE numerator (dilution attack)
+                Z3 encoding: `s.add(UGT(totalSupply_1, totalSupply_0))  # supply inflated before rate update`
+                Then check: `s.add(ULT(rewardPerToken_1, rewardPerToken_0))`
+
+            If you skip this step, your property will be too weak and Z3 will return UNSAT on a trivially-safe model — a FALSE NEGATIVE that lets real bugs through.
+        </step>
+
        <step number="3" title="MODEL & BOUND">
         Translate the contract state into Z3 bit-vectors to perfectly replicate the 256-bit EVM stack environment.
         - Use BitVecSort(256) for all uint256 state variables and constants.
@@ -43,6 +79,37 @@
 
         <step number="4" title="ENCODE THE PROPERTY">
             Negate the property. You are searching for a counterexample — a state where the invariant is violated. If Z3 returns SAT, a bug exists. If UNSAT, the property holds under your model.
+
+            CRITICAL RULE: Your negated property MUST include the state preconditions from step 2.5.
+            - WRONG: `s.add(And(amount > 0, shares == 0))` — too generic, Z3 returns UNSAT because this is safe under normal conditions
+            - RIGHT: `s.add(And(amount > 0, totalAssets > totalSupply * 100, shares == 0))` — includes the adversarial precondition
+
+            ANTI-FALSE-NEGATIVE PROTOCOL:
+            When the finding involves division, share calculations, or ratio computations, you MUST test MULTIPLE adversarial states in a SINGLE solver:
+            1. Normal state (baseline — should be UNSAT, confirms your model is correct)
+            2. Donation-inflated state (totalAssets >> totalSupply)
+            3. First-depositor state (totalSupply = 1, totalAssets very large)
+            4. Dust-amount state (amount = 1, denominator very large)
+
+            Implementation: use solver.push()/solver.pop() to test multiple scenarios:
+            ```
+            # Scenario 1: donation-inflated
+            s.push()
+            s.add(UGT(totalAssets, UMul(totalSupply, BitVecVal(1000, 256))))
+            s.add(And(UGT(amount, 0), shares == 0))
+            if s.check() == sat:
+                print("BUG FOUND (donation attack):", s.model())
+            s.pop()
+
+            # Scenario 2: first depositor
+            s.push()
+            s.add(totalSupply == BitVecVal(1, 256))
+            s.add(UGT(totalAssets, BitVecVal(100000, 256)))
+            s.add(And(UGT(amount, 0), shares == 0))
+            if s.check() == sat:
+                print("BUG FOUND (first depositor):", s.model())
+            s.pop()
+            ```
         </step>
 
         <step number="5" title="ENCODE EDGE CASES FROM FINDINGS">
@@ -67,7 +134,11 @@
  <step number="6" title="OUTPUT GENERATION">
             Your output MUST consist of exactly one of the following two options:
             OPTION A (Valid): 
-                1. A `<scratchpad>` block where you think step-by-step.
+                1. A `<scratchpad>` block where you think step-by-step. The scratchpad MUST include:
+                   - Target function and relevant state variables
+                   - State precondition analysis (from step 2.5): what adversarial state triggers the bug
+                   - SSA state timeline
+                   - Negated property with preconditions explained
                 2. A single ```python``` code block containing the executable Z3 script.
             OPTION B (Invalid/Hallucinated):
                 1. The `[SUPERVISOR_ALERT]` string detailing exactly why the math or variables do not align with the Solidity code.
@@ -118,8 +189,8 @@
         <constraint>NEVER add per-address bounds on Array variables.</constraint>
         <constraint>Use at most 3 concrete addresses: OWNER=0, CONTRACT=1, USER=2.</constraint>
         <constraint>Add bounds only for scalar Int variables, not Array entries.</constraint>
-        <constraint>One solver only. No nested solvers. No multiple check() calls.</constraint>
-        <constraint><![CDATA[ Keep total number of s.add() calls under 20. ]]></constraint>
+        <constraint>One solver only. No nested solvers. Use push()/pop() for multiple check() calls to test adversarial scenarios — this is the ONLY approved multi-check pattern.</constraint>
+        <constraint><![CDATA[ Keep total number of s.add() calls under 30 (higher limit accommodates push/pop multi-scenario testing). ]]></constraint>
     </critical_z3_constraints>
 
     <handling_missing_bounds>
@@ -140,38 +211,71 @@
     </handling_missing_bounds>
 
     <example_template>
-        <scenario>Testing an integer underflow in a withdraw function using SSA.</scenario>
+        <scenario>Testing a share-minting floor division bug in a vault deposit function, with adversarial state precondition analysis.</scenario>
         <expected_output>
             <scratchpad>
-                1. Target function is withdraw(amount). Relevant state: balances mapping, msg.sender, amount.
-                2. SSA State 0 (Initial): balances_0 (ArraySort), amount (Int).
-                3. SSA State 1 (After execution): balances_1 = Store(balances_0, msg_sender, balances_0[msg_sender] - amount).
-                4. Invariant: User balance cannot drop below 0.
-                5. Negation (bug condition): balances_1[msg_sender] < 0.
+                1. Target function: deposit(amount). Relevant state: totalAssets, totalSupply, shares mapping.
+                2. STATE PRECONDITION ANALYSIS (step 2.5):
+                   - Q1: Bug triggers when totalAssets >> totalSupply (donation inflated assets).
+                   - Q2: Adversary donates tokens directly to the vault, inflating totalAssets without minting shares.
+                   - Q3: Z3 precondition: UGT(totalAssets_0, UMul(totalSupply_0, BitVecVal(100, 256)))
+                3. SSA Timeline:
+                   - State 0: totalAssets_0, totalSupply_0, amount (user deposit)
+                   - shares = UDiv(UMul(amount, totalSupply_0), totalAssets_0)
+                   - State 1: totalAssets_1 = totalAssets_0 + amount, totalSupply_1 = totalSupply_0 + shares
+                4. Negated property WITH precondition: amount > 0 AND totalAssets inflated AND shares == 0
+                5. Multi-scenario: test normal state (should hold), donation state (should break), first-depositor state.
             </scratchpad>
             ```python
             from z3 import *
             s = Solver()
 
-            balances_0 = Array('balances_0', IntSort(), IntSort())
-            balances_1 = Array('balances_1', IntSort(), IntSort())
-            amount = Int('amount')
-            msg_sender = Int('msg_sender')
+            amount = BitVec('amount', 256)
+            totalAssets_0 = BitVec('totalAssets_0', 256)
+            totalSupply_0 = BitVec('totalSupply_0', 256)
 
-            s.add(amount > 0, amount <= 10**6)
-            s.add(msg_sender == 2)
-            s.add(balances_0[msg_sender] >= 0, balances_0[msg_sender] <= 10**6)
+            s.add(UGT(amount, 0), ULT(amount, 10**6))
+            s.add(UGE(totalAssets_0, 0), ULT(totalAssets_0, 10**6))
+            s.add(UGE(totalSupply_0, 0), ULT(totalSupply_0, 10**6))
 
-            s.add(amount <= balances_0[msg_sender])
-            s.add(balances_1 == Store(balances_0, msg_sender, balances_0[msg_sender] - amount))
+            shares = UDiv(UMul(amount, totalSupply_0), totalAssets_0)
 
-            s.add(balances_1[msg_sender] < 0)
-
+            # Scenario 1: donation-inflated state (totalAssets >> totalSupply)
+            s.push()
+            s.add(UGT(totalAssets_0, UMul(totalSupply_0, BitVecVal(1000, 256))))
+            s.add(shares == BitVecVal(0, 256))
             if s.check() == sat:
-                print("BUG FOUND:")
+                print("BUG FOUND (donation attack):")
                 print(s.model())
             else:
-                print("Property holds - no counterexample found")
+                print("Scenario 1: Property holds")
+            s.pop()
+
+            # Scenario 2: first depositor (totalSupply = 1, assets very large)
+            s.push()
+            s.add(totalSupply_0 == BitVecVal(1, 256))
+            s.add(UGT(totalAssets_0, BitVecVal(100000, 256)))
+            s.add(amount == BitVecVal(1, 256))
+            s.add(shares == BitVecVal(0, 256))
+            if s.check() == sat:
+                print("BUG FOUND (first depositor):")
+                print(s.model())
+            else:
+                print("Scenario 2: Property holds")
+            s.pop()
+
+            # Scenario 3: dust amount with large denominator
+            s.push()
+            s.add(amount == BitVecVal(1, 256))
+            s.add(UGT(totalAssets_0, BitVecVal(500000, 256)))
+            s.add(UGE(totalSupply_0, BitVecVal(1, 256)))
+            s.add(shares == BitVecVal(0, 256))
+            if s.check() == sat:
+                print("BUG FOUND (dust truncation):")
+                print(s.model())
+            else:
+                print("Scenario 3: Property holds")
+            s.pop()
             ```
         </expected_output>
     </example_template>
