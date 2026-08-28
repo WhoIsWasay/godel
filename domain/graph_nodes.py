@@ -86,12 +86,33 @@ def supervisor_node(state: GraphState, llm_pro):
 
 def bug_hunter_node(state: GraphState, inspector: Inspector):
     """Invokes the Isolator to find bugs, with robust JSON defense and strict function scoping."""
-    
+
     xml_packet = state.get("isolated_xml_packet", "")
     full_code = state.get("user_contract", "")
     readme = state.get("readme_specs", "")
     critique = state.get("supervisor_critique")
     focus_func = state.get("current_focus_function")
+
+    # --- RAG: retrieve historical vulnerability patterns for this function ---
+    rag_context = ""
+    try:
+        from domain.rag import retrieve_findings_for_hunter
+        rag_findings, rag_diag = retrieve_findings_for_hunter(
+            focus_func, contract_code=full_code, final_top_k=5
+        )
+        if rag_findings:
+            lines = []
+            for rf in rag_findings:
+                sev = rf.get("severity", "?").upper()
+                title = rf.get("title_normalized", "")
+                desc = rf.get("description", "")[:300]
+                lines.append(f"- [{sev}] {title}: {desc}")
+            rag_context = "\n\n=== KNOWN VULNERABILITY PATTERNS (from historical audits) ===\n"
+            rag_context += "These are REAL vulnerabilities found in similar contracts. "
+            rag_context += "Check if ANY apply to the current function:\n"
+            rag_context += "\n".join(lines)
+    except Exception as e:
+        print(f"      [RAG WARNING] hunter RAG retrieval failed (non-fatal): {e}")
     
     # Inject full contract reference, but STRICTLY bound the AI to the focus function
     input_text = f"""[CRITICAL INSTRUCTION]
@@ -111,7 +132,7 @@ A <cfg_abstraction> block may be present inside the isolation packet. It is DETE
 {xml_packet}
 
 === FULL CONTRACT REFERENCE (For internal helper calls) ===
-{full_code}"""
+{full_code}{rag_context}"""
 
     if critique:
         input_text += f"\n\n[SUPERVISOR CRITIQUE]: {critique}\nFix your previous analysis based on this feedback."

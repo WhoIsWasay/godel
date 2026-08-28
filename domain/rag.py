@@ -264,6 +264,77 @@ def retrieve_findings_for_specifier(finding: dict,
 
 
 # ---------------------------------------------------------------------------
+# 3b. Hunter RAG — retrieve historical patterns BEFORE bug hunter runs
+# ---------------------------------------------------------------------------
+def retrieve_findings_for_hunter(function_name: str,
+                                 contract_code: str = "",
+                                 final_top_k: int = 5,
+                                 top_k_per_query: int = 10) -> tuple[list[dict], dict]:
+    """
+    RAG round-trip for the bug hunter: builds queries from the function name
+    and contract code excerpt, retrieves historical vulnerability patterns.
+    Returns (formatted_findings, diagnostics).
+    """
+    t0 = time.time()
+    _raglog("=" * 72)
+    _raglog(f"HUNTER RAG RETRIEVAL for function: {function_name}")
+
+    queries = []
+    if function_name:
+        queries.append(f"{function_name} vulnerability")
+    if contract_code:
+        sig_match = re.search(
+            rf"function\s+{re.escape(function_name)}\s*\([^)]*\)[^{{]*\{{([^}}]{{0,800}})",
+            contract_code,
+        )
+        if sig_match:
+            queries.append(sig_match.group(0).strip())
+
+    seen, deduped = set(), []
+    for q in queries:
+        key = q.lower()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(q)
+    queries = deduped[:3]
+
+    if not queries:
+        _raglog("No queries derivable — returning empty context.")
+        return [], {"error": "no_queries", "elapsed": time.time() - t0}
+
+    _raglog(f"build_queries() -> {len(queries)} query/ies")
+    for i, q in enumerate(queries, 1):
+        _raglog(f"    Q{i}: {q[:150]}")
+
+    try:
+        from Infrastructure.postgres import retrieve
+        results = retrieve(queries,
+                           top_k_per_query=top_k_per_query,
+                           final_top_k=final_top_k)
+    except Exception as e:
+        _raglog(f"RETRIEVAL FAILED (non-fatal): {type(e).__name__}: {e}")
+        return [], {"error": str(e), "elapsed": time.time() - t0}
+
+    formatted = []
+    for r in results:
+        formatted.append({
+            "title_normalized": r.get("title_normalized") or "",
+            "vuln_class": r.get("vuln_class") or "",
+            "severity": r.get("severity") or "",
+            "description": r.get("description") or "",
+            "code_snippet": r.get("code_snippet") or "",
+        })
+
+    diagnostics = {
+        "queries": queries,
+        "n_retrieved": len(results),
+        "elapsed": round(time.time() - t0, 2),
+    }
+    _raglog(f"HUNTER RAG DONE — {len(results)} findings in {diagnostics['elapsed']}s")
+    return formatted, diagnostics
+
+
+# ---------------------------------------------------------------------------
 # 4. Standalone benchmark runner (used by the RAG-only test harness)
 # ---------------------------------------------------------------------------
 def run_rag_benchmark(findings: list[dict],

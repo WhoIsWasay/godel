@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0
-pragma solidity 0.6.12;
+pragma solidity ^0.8.0;
 
-import "../interfaces/IYieldSource.sol";
-import "../external/yearn/IYVaultV2.sol";
+import "./interfaces/IYieldSource.sol";
+import "./interfaces/IYVaultV2.sol";
 
-import "@openzeppelin/contracts-upgradeable/math/SafeMathUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/IERC20Upgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/token/ERC20/SafeERC20Upgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 
 
 /// @title Yield source for a PoolTogether prize pool that generates yield by depositing into Yearn Vaults.
@@ -19,7 +18,6 @@ import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol
 /// @notice Yield Source Prize Pools subclasses need to implement this interface so that yield can be generated.
 contract YearnV2YieldSource is IYieldSource, ERC20Upgradeable, OwnableUpgradeable, ReentrancyGuardUpgradeable {
     using SafeERC20Upgradeable for IERC20Upgradeable;
-    using SafeMathUpgradeable for uint;
     
     /// @notice Yearn Vault which manages `token` to generate yield
     IYVaultV2 public vault;
@@ -191,7 +189,7 @@ contract YearnV2YieldSource is IYieldSource, ERC20Upgradeable, OwnableUpgradeabl
         }
         uint256 currentBalance = token.balanceOf(address(this));
 
-        return previousBalance.sub(currentBalance);
+        return previousBalance - currentBalance;
     }
 
     /// @notice Returns the amount of shares of yearn's vault that the Yield Source holds
@@ -218,7 +216,7 @@ contract YearnV2YieldSource is IYieldSource, ERC20Upgradeable, OwnableUpgradeabl
     /// @dev amount of deposit token held in Yield Source + investment (amount held in Yearn's Vault)
     /// @return Total AUM denominated in deposit Token
     function _totalAssetsInToken() internal view returns (uint256) {
-        return _balanceOfToken().add(_ySharesToToken(_balanceOfYShares()));
+        return _balanceOfToken() + _ySharesToToken(_balanceOfYShares());
     }
 
     /// @notice Support function to retrieve used by Vault
@@ -234,14 +232,14 @@ contract YearnV2YieldSource is IYieldSource, ERC20Upgradeable, OwnableUpgradeabl
     /// @param tokens Amount of tokens to be converted
     /// @return yShares to redeem to receive `tokens` deposit token
     function _tokenToYShares(uint256 tokens) internal view returns (uint256) {
-        return tokens.mul(10 ** _vaultDecimals()).div(_pricePerYShare());
+        return tokens * (10 ** _vaultDecimals()) / _pricePerYShare();
     }
 
     /// @notice Converter from deposit yShares (yearn vault's shares) to token 
     /// @param yShares Vault's shares to be converted
     /// @return tokens that will be received if yShares shares are redeemed
     function _ySharesToToken(uint256 yShares) internal view returns (uint256) {
-        return yShares.mul(_pricePerYShare()).div(10 ** _vaultDecimals());
+        return yShares * _pricePerYShare() / (10 ** _vaultDecimals());
     }
 
     /// @notice Function to calculate the amount of Yield Source shares equivalent to a deposit tokens amount
@@ -252,7 +250,7 @@ contract YearnV2YieldSource is IYieldSource, ERC20Upgradeable, OwnableUpgradeabl
             shares = tokens;
         } else {
             uint256 _totalTokens = _totalAssetsInToken();
-            shares = tokens.mul(totalSupply()).div(_totalTokens);
+            shares = tokens * totalSupply() / _totalTokens;
         }
     }
 
@@ -265,7 +263,7 @@ contract YearnV2YieldSource is IYieldSource, ERC20Upgradeable, OwnableUpgradeabl
             tokens = shares;
         } else {
             uint256 _totalTokens = _totalAssetsInToken();
-            tokens = shares.mul(_totalTokens).div(totalSupply());
+            tokens = shares * _totalTokens / totalSupply();
         }
     }
 
