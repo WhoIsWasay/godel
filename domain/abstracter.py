@@ -437,17 +437,16 @@ def abstract_contract(sol_path: str, use_cache: bool = True) -> dict | None:
                 # checking. Retry once with the viaIR profile before giving up.
                 if "stack too deep" in str(compile_err).lower():
                     logger.info("[ABSTRACTER] stack-too-deep — retrying Slither with --via-ir --optimize")
-                    kwargs["solc_args"] = ["--via-ir", "--optimize"]
+                    kwargs["solc_args"] = "--via-ir --optimize"
                     slither = Slither(fname, **kwargs)
                 else:
                     raise
             functions = {}
-            contract_name = None
+            contract_names = []
             for c in slither.contracts:
                 if c.is_interface or c.is_library:
                     continue
-                if contract_name is None:
-                    contract_name = c.name
+                contract_names.append(c.name)
                 for f in c.functions:
                     if f.is_constructor or not f.entry_point:
                         continue
@@ -457,8 +456,17 @@ def abstract_contract(sol_path: str, use_cache: bool = True) -> dict | None:
                         continue
                     functions[f.full_name] = _extract_function_facts(f)
 
-            if contract_name is None:
+            if not contract_names:
                 return None
+            # Flattened files list dependencies first (OZ Context before the
+            # target), so first-contract selection grabs the wrong storage
+            # layout. Prefer the contract matching the file stem; otherwise
+            # take the LAST one (flatten/target order), not the first.
+            stem = os.path.splitext(os.path.basename(sol_path))[0].lower()
+            contract_name = next(
+                (n for n in contract_names if n.lower() == stem),
+                contract_names[-1],
+            )
 
             analysis = {
                 "file": os.path.abspath(sol_path),
