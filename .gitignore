@@ -76,5 +76,7 @@ solCon/
 # Private benchmark corpus + sample fixtures (personal data, stays local)
 TestsDone/
 testOfCode/fixtures/
+# External audit-contest benchmark targets (large flattened contracts, local only)
+Fv-audits/
 # Live-audit proof bundle — kept local, not part of the submission repo
 hackathon_proof/

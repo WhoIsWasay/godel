@@ -429,7 +429,18 @@ def abstract_contract(sol_path: str, use_cache: bool = True) -> dict | None:
             from slither.slither import Slither
 
             kwargs = {"solc": solc_binary} if solc_binary else {}
-            slither = Slither(fname, **kwargs)
+            try:
+                slither = Slither(fname, **kwargs)
+            except Exception as compile_err:
+                # Modern vault codebases (OZ v5 + deep call chains) compile only
+                # with viaIR; plain solc dies with 'Stack too deep' AFTER type
+                # checking. Retry once with the viaIR profile before giving up.
+                if "stack too deep" in str(compile_err).lower():
+                    logger.info("[ABSTRACTER] stack-too-deep — retrying Slither with --via-ir --optimize")
+                    kwargs["solc_args"] = ["--via-ir", "--optimize"]
+                    slither = Slither(fname, **kwargs)
+                else:
+                    raise
             functions = {}
             contract_name = None
             for c in slither.contracts:
