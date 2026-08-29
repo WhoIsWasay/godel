@@ -715,6 +715,22 @@ def run_pipeline(contract_folder: str = None) -> list:
             print(f"      [SCOPE] primary contract only — excluded {len(excluded)} "
                   f"function(s) from inlined libraries/interfaces/bases: {shown}")
 
+        # Optional targeted audit: GODEL_FUNCTIONS=name1,name2 restricts the
+        # fan-out to the listed functions (case-insensitive), keeping
+        # credit-sensitive runs surgical. Unknown names warn, never crash.
+        fn_filter = os.environ.get("GODEL_FUNCTIONS", "").strip()
+        if fn_filter:
+            wanted = {n.strip().lower() for n in fn_filter.split(",") if n.strip()}
+            selected = [f for f in functions if f["name"].lower() in wanted]
+            matched = {f["name"].lower() for f in selected}
+            missing = sorted(wanted - matched)
+            if missing:
+                print(f"      [TARGET] WARNING: not found in contract: {', '.join(missing)}")
+            print(f"      [TARGET] GODEL_FUNCTIONS filter active — auditing "
+                  f"{len(selected)}/{len(functions)} function(s): "
+                  f"{', '.join(f['name'] for f in selected)}")
+            functions = selected
+
         print(f"\nProcessing File: {sol_path} ({len(functions)} valid execution functions identified)")
 
         if config.SKIP_READONLY_FUNCTIONS:
