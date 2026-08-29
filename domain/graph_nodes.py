@@ -199,7 +199,13 @@ A <cfg_abstraction> block may be present inside the isolation packet. It is DETE
             # Fallback to the original external extractor if all else fails
             parsed_data = inspector.extract_json(raw_response)
             findings = parsed_data.get("findings", [])
-            parse_error = None
+            if findings:
+                parse_error = None
+            else:
+                # A genuine empty findings array parses on the primary path,
+                # so empty-after-repair means the payload was garbage, not
+                # clean — never let it masquerade as a safe verdict.
+                parse_error = f"Primary JSON parse failed ({e}); fallback extractor recovered no findings."
         except Exception as fallback_err:
             findings = []
             parse_error = f"Primary JSON parse failed ({e}); fallback extractor failed ({fallback_err})."
