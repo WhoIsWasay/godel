@@ -95,15 +95,13 @@ contract GodelLegacyTest {
 
     function assertEq(string memory a, string memory b) internal pure {
         require(
-            keccak256(abi.encodePacked(a)) == keccak256(abi.encodePacked(b)),
-            "GodelLegacyTest: assertEq(string) failed"
+            keccak256(abi.encodePacked(a)) == keccak256(abi.encodePacked(b)), "GodelLegacyTest: assertEq(string) failed"
         );
     }
 
     function assertEq(bytes memory a, bytes memory b) internal pure {
         require(
-            keccak256(abi.encodePacked(a)) == keccak256(abi.encodePacked(b)),
-            "GodelLegacyTest: assertEq(bytes) failed"
+            keccak256(abi.encodePacked(a)) == keccak256(abi.encodePacked(b)), "GodelLegacyTest: assertEq(bytes) failed"
         );
     }
 
