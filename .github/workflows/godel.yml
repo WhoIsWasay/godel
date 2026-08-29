@@ -47,8 +47,17 @@ jobs:
           if [ -z "$FOLDER" ]; then
             FOLDER="${GODEL_CONTRACTS_FOLDER:-}"
           fi
+          # Push/PR smoke audit: fall back to the committed benchmark so the
+          # workflow is green by default instead of dying on missing input.
           if [ -z "$FOLDER" ] || [ ! -d "$FOLDER" ]; then
-            echo "::error::No valid contract folder. Set workflow input 'contract_folder' or the GODEL_CONTRACTS_FOLDER repo variable (got: '$FOLDER')."
+            if [ -d "Benchmarks/Visor" ]; then
+              FOLDER="Benchmarks/Visor"
+              echo "dry=1" >> "$GITHUB_OUTPUT"
+              echo "Falling back to committed smoke-audit benchmark: $FOLDER (DRY RUN — no API credits spent)"
+            fi
+          fi
+          if [ -z "$FOLDER" ] || [ ! -d "$FOLDER" ]; then
+            echo "::error::No valid contract folder. Set workflow input 'contract_folder', the GODEL_CONTRACTS_FOLDER repo variable, or commit a Benchmarks/Visor folder (got: '$FOLDER')."
             exit 1
           fi
           echo "path=$FOLDER" >> "$GITHUB_OUTPUT"
@@ -60,6 +69,7 @@ jobs:
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           GODEL_CONTRACTS_FOLDER: ${{ steps.folder.outputs.path }}
+          GODEL_DRY_RUN: ${{ steps.folder.outputs.dry || '0' }}
         run: python main.py --contracts "$GODEL_CONTRACTS_FOLDER"
 
       - name: Render reports
