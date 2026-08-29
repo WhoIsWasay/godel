@@ -100,6 +100,97 @@ def needs_legacy_harness(source: str) -> bool:
     return not allows_modern_forge_std(source)
 
 
+def _spec_interval(spec: str):
+    """One pragma spec as (lower, lower_incl, upper, upper_incl); upper None
+    means unbounded above. Unparseable specs return a fully open interval so
+    they never block (same fail-open policy as _spec_allows_modern)."""
+    spec = spec.strip()
+    if not spec:
+        return (None, True, None, False)
+
+    if spec.startswith("^"):
+        v = _parse_version(spec[1:])
+        if v is None:
+            return (None, True, None, False)
+        major, minor, _patch = v
+        cap = (major, minor + 1, 0) if major == 0 else (major + 1, 0, 0)
+        return (v, True, cap, False)
+
+    lower, upper = None, None
+    lower_incl, upper_incl = True, False
+    saw_operator = False
+    for m in re.finditer(r"(>=|<=|>|<|=)?\s*(\d+\s*\.\s*\d+(?:\s*\.\s*\d+)?)", spec):
+        op = (m.group(1) or "").strip()
+        v = _parse_version(m.group(2))
+        if v is None:
+            continue
+        if op in ("<", "<="):
+            saw_operator = True
+            if upper is None or v < upper or (v == upper and op == "<"):
+                upper, upper_incl = v, op == "<="
+        elif op in (">", ">="):
+            saw_operator = True
+            if lower is None or v > lower or (v == lower and op == ">"):
+                lower, lower_incl = v, op == ">="
+        else:
+            if not saw_operator and _is_single_version(spec):
+                return (v, True, v, True)
+            if lower is None or v > lower:
+                lower, lower_incl = v, True
+    return (lower, lower_incl, upper, upper_incl)
+
+
+def _file_interval(source: str):
+    """Intersection of every pragma solidity statement in a file, or None
+    when the file declares no pragma (no constraint)."""
+    specs = pragma_statements(source)
+    if not specs:
+        return None
+    lower, upper = None, None
+    lower_incl, upper_incl = True, False
+    for s in specs:
+        l, li, u, ui = _spec_interval(s)
+        if l is not None and (lower is None or l > lower or (l == lower and not li)):
+            lower, lower_incl = l, li
+        if u is not None and (upper is None or u < upper or (u == upper and not ui)):
+            upper, upper_incl = u, ui
+    return (lower, lower_incl, upper, upper_incl)
+
+
+def _interval_empty(iv) -> bool:
+    lower, lower_incl, upper, upper_incl = iv
+    if lower is None or upper is None:
+        return False
+    if lower < upper:
+        return False
+    if lower == upper:
+        return not (lower_incl and upper_incl)
+    return True
+
+
+def pragmas_conflict(suite_code: str, target_source: str) -> bool:
+    """True when NO single solc version can compile both files together.
+    forge builds the project with one version, so such a suite can never
+    compile regardless of how correct its code is. Only reported when both
+    sides actually declare pragmas — never block on speculation."""
+    a = _file_interval(suite_code)
+    b = _file_interval(target_source)
+    if a is None or b is None:
+        return False
+    al, ali, au, aui = a
+    bl, bli, bu, bui = b
+
+    lower, lower_incl = al, ali
+    if bl is not None and (lower is None or bl > lower or (bl == lower and not bli)):
+        lower, lower_incl = bl, bli
+    upper, upper_incl = au, aui
+    if bu is not None and (upper is None or bu < upper or (bu == upper and not bui)):
+        upper, upper_incl = bu, bui
+    if lower is None or upper is None:
+        return False
+    return _interval_empty((lower, lower_incl, upper, upper_incl))
+
+
 LEGACY_HEAL_HINT = (
     "LEGACY MODE CONSTRAINT: the target contract's pragma does not allow solc "
     ">= 0.8.13, so forge-std (forge-std/Test.sol, Vm.sol, StdInvariant, "

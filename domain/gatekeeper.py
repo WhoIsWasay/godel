@@ -175,12 +175,15 @@ class FoundryGatekeeper:
         except Exception as e:
             logger.warning("[GATEKEEPER WARNING] Could not write debug artifact: %s", e)
 
-    def execute_qc_validation(self, initial_test_code: str, max_retries: int = None, debug_tag: str = "candidate", debug_dir: str = None, legacy: bool = False) -> tuple:
+    def execute_qc_validation(self, initial_test_code: str, max_retries: int = None, debug_tag: str = "candidate", debug_dir: str = None, legacy: bool = False, target_source: str = None) -> tuple:
         """Runs Forge against the candidate test suite. Returns (status, forge_output).
 
         legacy=True means the target's pragma excludes solc >= 0.8.13, so
         forge-std cannot compile; suites importing it are healed
-        deterministically instead of burning a doomed forge invocation."""
+        deterministically instead of burning a doomed forge invocation.
+        target_source (when given alongside legacy) enables the deterministic
+        pragma-conflict pre-check: a suite whose pragma shares no solc version
+        with the target can never compile."""
         if max_retries is None:
             max_retries = config.GATEKEEPER_MAX_RETRIES
         from domain.solc_compat import LEGACY_HEAL_HINT
@@ -199,18 +202,36 @@ class FoundryGatekeeper:
                 # invoking forge. Import statements are located in the
                 # comment-masked text (so comments mentioning forge-std can't
                 # trigger a false heal) and checked against the original text,
-                # because the mask blanks string contents.
+                # because the mask blanks string contents. A second trigger:
+                # the suite's pragma sharing no solc version with the target
+                # (forge builds with ONE version, so it can never compile).
                 from piyoxml import create_index_mask
+                from domain.solc_compat import pragmas_conflict, pragma_statements
                 _masked = create_index_mask(current_test_code)
                 _legacy_import = any(
                     "forge-std" in current_test_code[m.start():m.end()]
                     for m in re.finditer(r'\bimport\b[^;]+;', _masked)
                 )
-                if legacy and _legacy_import:
-                    print("      [CEGIS WARNING] Legacy target + forge-std import detected — healing without invoking forge...")
-                    synthetic_error = ("Compiler run failed (deterministic pre-check): the suite imports "
-                                       "forge-std, which requires solc >= 0.8.13, but the target contract's "
-                                       "pragma forbids it.\n" + LEGACY_HEAL_HINT)
+                _pragma_conflict = bool(
+                    legacy and target_source
+                    and pragmas_conflict(current_test_code, target_source)
+                )
+                if legacy and (_legacy_import or _pragma_conflict):
+                    reasons = []
+                    if _legacy_import:
+                        reasons.append("it imports forge-std, which requires solc >= 0.8.13, "
+                                       "but the target contract's pragma forbids it")
+                    if _pragma_conflict:
+                        _suite_pragmas = "; ".join(pragma_statements(current_test_code)) or "none"
+                        _target_pragmas = "; ".join(pragma_statements(target_source)) or "unknown"
+                        reasons.append(f"it declares `pragma solidity {_suite_pragmas}` while the "
+                                       f"target requires `pragma solidity {_target_pragmas}` — no "
+                                       f"single solc version can compile both; mirror the target's "
+                                       f"pragma in the suite")
+                    print("      [CEGIS WARNING] Legacy pre-check tripped "
+                          "(forge-std import / pragma conflict) — healing without invoking forge...")
+                    synthetic_error = ("Compiler run failed (deterministic pre-check): "
+                                       + "; ".join(reasons) + ".\n" + LEGACY_HEAL_HINT)
                     if attempt < max_retries and self.verifier_agent:
                         current_test_code = self.verifier_agent.heal_test_suite(
                             current_test_code, synthetic_error, legacy=True)
