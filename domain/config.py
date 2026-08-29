@@ -80,6 +80,10 @@ SUPERVISOR_MAX_ITERATIONS = _env_int("GODEL_SUPERVISOR_MAX_ITERATIONS", 3)
 EXECUTOR_MAX_ITERATIONS    = _env_int("GODEL_EXECUTOR_MAX_ITERATIONS", 4)
 GATEKEEPER_MAX_RETRIES     = _env_int("GODEL_GATEKEEPER_MAX_RETRIES", 3)
 HUNTER_MAX_PARSE_RETRIES   = _env_int("GODEL_HUNTER_PARSE_RETRIES", 2)
+# Independent isolator passes per function, merged with line/intent dedup.
+# Default 1 keeps cost unchanged; 2-3 lifts recall (each pass samples a
+# different hypothesis path) at proportional hunter-token cost.
+HUNTER_PASSES              = _env_int("GODEL_HUNTER_PASSES", 1)
 FUNCTION_MAX_RETRIES       = _env_int("GODEL_FUNCTION_MAX_RETRIES", 2)
 
 # ==========================================

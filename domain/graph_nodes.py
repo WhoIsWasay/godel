@@ -86,6 +86,48 @@ def supervisor_node(state: GraphState, llm_pro):
         }
 
 
+def _parse_hunter_output(raw_response: str, inspector: Inspector):
+    """Robust JSON extraction for one hunter pass. Returns (findings, parse_error)."""
+    findings = []
+    parse_error = None
+    clean_response = re.sub(r'<think>.*?</think>', '', raw_response, flags=re.DOTALL).strip()
+
+    try:
+        if "```json" in clean_response:
+            clean_response = clean_response.split("```json")[1].split("```")[0].strip()
+        elif "```" in clean_response:
+            clean_response = clean_response.split("```")[1].split("```")[0].strip()
+
+        # strict=False fixes the "Invalid control character" error natively
+        parsed_data = json.loads(clean_response, strict=False)
+
+        if isinstance(parsed_data, dict):
+            findings = parsed_data.get("findings", [])
+        elif isinstance(parsed_data, list):
+            findings = parsed_data
+
+    except json.JSONDecodeError as e:
+        print(f"      [BUG HUNTER WARNING] JSON Parse Error: {e}. Falling back to Inspector extractor...")
+        try:
+            parsed_data = inspector.extract_json(raw_response)
+            findings = parsed_data.get("findings", [])
+            if not findings:
+                # A genuine empty findings array parses on the primary path,
+                # so empty-after-repair means the payload was garbage, not
+                # clean — never let it masquerade as a safe verdict.
+                parse_error = f"Primary JSON parse failed ({e}); fallback extractor recovered no findings."
+        except Exception as fallback_err:
+            findings = []
+            parse_error = f"Primary JSON parse failed ({e}); fallback extractor failed ({fallback_err})."
+
+    if not isinstance(findings, list):
+        findings = []
+        parse_error = "Isolator output 'findings' was not a list."
+
+    findings = [f for f in findings if isinstance(f, dict)]
+    return findings, parse_error
+
+
 def bug_hunter_node(state: GraphState, inspector: Inspector):
     """Invokes the Isolator to find bugs, with robust JSON defense and strict function scoping."""
 
@@ -159,56 +201,37 @@ A <cfg_abstraction> block may be present inside the isolation packet. It is DETE
             "no markdown fences beyond ```json, no trailing commas, all strings double-quoted."
         )
 
-    try:
-        raw_response = inspector._invoke(inspector.isolator_agent, inspector.isolator_prompt, input_text)
-    except EmptyResponseError as e:
-        # Low-level retries exhausted on empty provider responses. This must
-        # never masquerade as a clean safety verdict — flag it so routing
-        # retries at graph level or aborts as analysis_failed.
-        logger.error("[BUG HUNTER EMPTY RESPONSE] %s", e)
-        print(f"      [BUG HUNTER ERROR] Isolator returned only empty responses — flagged as analysis failure, NOT as 'safe'.")
-        return {
-            "findings": [],
-            "hunter_parse_error": f"Isolator returned only empty responses after retries: {e}",
-            "hunter_retries": retry_n + 1,
-            "messages": [AIMessage(content="[BUG HUNTER ERROR]: Empty provider responses flagged as analysis failure.")],
-        }
-    
-    # --- ROBUST JSON EXTRACTION ---
-    findings = []
-    parse_error = None
-    clean_response = re.sub(r'<think>.*?</think>', '', raw_response, flags=re.DOTALL).strip()
-    
-    try:
-        if "```json" in clean_response:
-            clean_response = clean_response.split("```json")[1].split("```")[0].strip()
-        elif "```" in clean_response:
-            clean_response = clean_response.split("```")[1].split("```")[0].strip()
-        
-        # strict=False fixes the "Invalid control character" error natively
-        parsed_data = json.loads(clean_response, strict=False)
-        
-        if isinstance(parsed_data, dict):
-            findings = parsed_data.get("findings", [])
-        elif isinstance(parsed_data, list):
-            findings = parsed_data
-            
-    except json.JSONDecodeError as e:
-        print(f"      [BUG HUNTER WARNING] JSON Parse Error: {e}. Falling back to Inspector extractor...")
+    passes = max(1, config.HUNTER_PASSES)
+    all_findings = []
+    parse_errors = []
+    for pass_i in range(passes):
         try:
-            # Fallback to the original external extractor if all else fails
-            parsed_data = inspector.extract_json(raw_response)
-            findings = parsed_data.get("findings", [])
-            if findings:
-                parse_error = None
-            else:
-                # A genuine empty findings array parses on the primary path,
-                # so empty-after-repair means the payload was garbage, not
-                # clean — never let it masquerade as a safe verdict.
-                parse_error = f"Primary JSON parse failed ({e}); fallback extractor recovered no findings."
-        except Exception as fallback_err:
-            findings = []
-            parse_error = f"Primary JSON parse failed ({e}); fallback extractor failed ({fallback_err})."
+            raw_response = inspector._invoke(inspector.isolator_agent, inspector.isolator_prompt, input_text)
+        except EmptyResponseError as e:
+            # This pass produced only empty provider responses even after
+            # low-level retries. Record it; other passes may still deliver.
+            logger.error("[BUG HUNTER EMPTY RESPONSE] pass %d: %s", pass_i + 1, e)
+            parse_errors.append(f"pass {pass_i + 1}: empty responses after retries ({e})")
+            continue
+        found, err = _parse_hunter_output(raw_response, inspector)
+        all_findings.extend(found)
+        if err:
+            parse_errors.append(f"pass {pass_i + 1}: {err}")
+    
+    findings = all_findings
+    if passes > 1 and len(findings) > 1:
+        for i, f in enumerate(findings, start=1):
+            f.setdefault("id", i)
+        findings = inspector.deduplicate(findings)
+        print(f"      [BUG HUNTER] {passes} passes merged: {len(all_findings)} raw -> {len(findings)} unique findings")
+
+    # Every pass failed and nothing was recovered: this must never
+    # masquerade as a clean safety verdict — flag it so routing retries
+    # at graph level or aborts as analysis_failed. Partial success
+    # (findings recovered despite a failed pass) is accepted.
+    parse_error = "; ".join(parse_errors) if (parse_errors and not findings) else None
+    if parse_error:
+        print(f"      [BUG HUNTER ERROR] All {passes} pass(es) failed to produce findings — flagged as analysis failure, NOT as 'safe'.")
             
     if not isinstance(findings, list):
         findings = []
@@ -331,6 +354,11 @@ def executor_node(state: GraphState, cegis_tool: CEGIS):
     elif result["status"] == "unsat":
         remaining = state.get("findings", []) or []
         updates["findings"] = remaining[1:] if remaining else []
+        if updates["findings"]:
+            # Queue advanced to the next finding — give it a fresh executor
+            # budget. Without this, the first finding can burn
+            # EXECUTOR_MAX_ITERATIONS and starve every queued sibling.
+            updates["executor_runs"] = 0
         _handle_unsat_verdict(state, updates)
     elif result["status"] == "vacuous":
         # SANITY probe failed: the base model is over-constrained, so every
@@ -367,6 +395,7 @@ def gatekeeper_node(state: GraphState, gatekeeper: FoundryGatekeeper):
         # Consume this finding but keep any others queued for verification.
         return {
             "findings": remaining_findings[1:],
+            "executor_runs": 0,
             "messages": [AIMessage(content="[GATEKEEPER]: Finding out of scope. Dropped.")]
         }
         
@@ -436,11 +465,13 @@ def _gatekeeper_verify(state, gatekeeper, finding, remaining_findings,
         return {
             "verified_bugs": current_bugs + [new_bug],
             "findings": remaining_findings[1:],
+            "executor_runs": 0,
             "messages": [AIMessage(content="[GATEKEEPER]: Bug CONFIRMED in EVM execution.")]
         }
     elif qc_status == "property_held":
         return {
             "findings": remaining_findings[1:],
+            "executor_runs": 0,
             "messages": [AIMessage(content="[GATEKEEPER]: FALSE POSITIVE. Property held during EVM execution. Dropping finding.")]
         }
     else:
@@ -456,6 +487,7 @@ def _gatekeeper_verify(state, gatekeeper, finding, remaining_findings,
         return {
             "verified_bugs": current_bugs + [new_bug],
             "findings": remaining_findings[1:],
+            "executor_runs": 0,
             "messages": [AIMessage(content=f"[GATEKEEPER]: Execution failed ({qc_status}). Pushing Z3-proven bug to manual review.")]
         }
 
