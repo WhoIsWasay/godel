@@ -1,0 +1,1 @@
+if (nftContract == nftInfo.nftContract && tokenId == nftInfo.tokenId) { ... nfts.pop(); emit RemoveNftToken(nftContract, tokenId); break; }
