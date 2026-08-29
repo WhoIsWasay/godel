@@ -247,12 +247,20 @@ with patch.object(subprocess, "run", return_value=fake_run(1, "", COMPILE_ERR)):
 # ============================================================ isolator routing
 print("== T6: Isolator model routing ==")
 import domain.pipeline as pl  # noqa: E402
+from domain import config as _cfg  # noqa: E402
 
 _default_model = getattr(pl.llm_isolator, "model_name",
                          getattr(pl.llm_isolator, "model", ""))
-check("unset flag -> isolator falls back to reasoning model", _default_model == "deepseek-v4-pro")
-check("compositor always uses reasoning model",
-      getattr(pl.llm_pro, "model_name", getattr(pl.llm_pro, "model", "")) == "deepseek-v4-pro")
+if _cfg.ISOLATOR_MODEL:
+    check("flag set -> isolator uses configured model", _default_model == _cfg.ISOLATOR_MODEL)
+else:
+    check("unset flag -> isolator falls back to reasoning client",
+          pl.llm_isolator is pl.llm_pro)
+# Pro was retired (commit aa06bca): the reasoning client runs flash with a
+# max-reasoning budget, and downstream machine verification (supervisor/Z3/
+# Foundry) carries the soundness, not model tier.
+check("reasoning client runs flash (Pro retired)",
+      getattr(pl.llm_pro, "model_name", getattr(pl.llm_pro, "model", "")) == "deepseek-v4-flash")
 check("flag propagates to Inspector.isolator_agent",
       pl.inspector.isolator_agent is pl.llm_isolator)
 
