@@ -206,15 +206,48 @@ def extract_functions_from_xml(xml_string: str) -> list:
             body = "".join(el.itertext()).strip()
             if not name or "{" not in body:
                 continue
-            functions.append({"name": name, "body": body})
+            functions.append({"name": name, "body": body,
+                              "container": el.get("container") or ""})
         return functions
     pattern = r'<function\s+name="([^"]+)"[^>]*>(.*?)</function>'
     matches = re.findall(pattern, xml_string, re.DOTALL)
     for name, body in matches:
         if "{" not in body:
             continue
-        functions.append({"name": name, "body": _strip_cdata(body)})
+        functions.append({"name": name, "body": _strip_cdata(body),
+                          "container": ""})
     return functions
+
+
+def scope_functions_to_primary_contract(functions: list, stem: str) -> tuple:
+    """Restrict per-function fan-out to the file's primary contract.
+
+    Flattened benchmarks inline library/interface/base stubs (SafeMath,
+    Address, ...); auditing those wastes credits and yields stub-targeted
+    false positives (Visor run 2026-08: 74 graphs, 60+ on stubs). Uses the
+    piyoxml container attribute to keep only functions defined inside the
+    primary contract. Falls back to the full list whenever scoping is
+    ambiguous or would leave zero functions — never silently shrinks
+    coverage. Returns (kept, excluded_names)."""
+    containers = {f.get("container") for f in functions if f.get("container")}
+    if not containers:
+        return functions, []
+    contract_containers = sorted(c for c in containers if c.startswith("contract "))
+    target = None
+    stem_l = str(stem or "").lower()
+    for c in contract_containers:
+        if c.split(" ", 1)[1].lower() == stem_l:
+            target = c
+            break
+    if target is None and len(contract_containers) == 1:
+        target = contract_containers[0]
+    if target is None:
+        return functions, []
+    kept = [f for f in functions if f.get("container") == target]
+    if not kept:
+        return functions, []
+    excluded = [f["name"] for f in functions if f.get("container") != target]
+    return kept, excluded
 
 
 def _parse_audit_xml(xml_string: str):
@@ -673,6 +706,14 @@ def run_pipeline(contract_folder: str = None) -> list:
         interfaces = extract_element_text(xml_str, "interface")
         state_vars = extract_element_text(xml_str, "state_variables")
         functions = extract_functions_from_xml(xml_str)
+
+        # Scope fan-out to the primary contract: flattened files inline
+        # library/interface/base stubs that must not spawn audit graphs.
+        functions, excluded = scope_functions_to_primary_contract(functions, stem)
+        if excluded:
+            shown = ", ".join(excluded[:12]) + ("..." if len(excluded) > 12 else "")
+            print(f"      [SCOPE] primary contract only — excluded {len(excluded)} "
+                  f"function(s) from inlined libraries/interfaces/bases: {shown}")
 
         print(f"\nProcessing File: {sol_path} ({len(functions)} valid execution functions identified)")
 

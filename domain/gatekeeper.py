@@ -34,7 +34,9 @@ def classify_forge_json(stdout_text: str):
     'harness_error'}, or None when stdout is not a valid JSON report — the
     caller then falls back to the legacy text heuristics. Tolerates forge
     version drift by collecting every boolean 'success' field anywhere in the
-    document instead of assuming a fixed schema."""
+    document instead of assuming a fixed schema. Newer forge versions replace
+    the boolean 'success' field with 'status': 'Success'/'Failure' — both are
+    collected."""
     s = (stdout_text or "").strip()
     if not (s.startswith("{") or s.startswith("[")):
         return None
@@ -45,15 +47,23 @@ def classify_forge_json(stdout_text: str):
 
     results = []
 
-    def _walk(node):
+    def _walk(node, key=None):
+        if key == "traces":
+            # Trace arena nodes carry per-CALL success flags; an inner
+            # reverted call (vm.expectRevert, try/catch) inside a PASSING
+            # test would falsely confirm the suite.
+            return
         if isinstance(node, dict):
-            if isinstance(node.get("success"), bool):
+            status = node.get("status")
+            if isinstance(status, str) and status in ("Success", "Failure"):
+                results.append(status == "Success")
+            elif isinstance(node.get("success"), bool):
                 results.append(node["success"])
-            for v in node.values():
-                _walk(v)
+            for k, v in node.items():
+                _walk(v, k)
         elif isinstance(node, list):
             for v in node:
-                _walk(v)
+                _walk(v, key)
 
     _walk(data)
     if not results:
@@ -165,10 +175,15 @@ class FoundryGatekeeper:
         except Exception as e:
             logger.warning("[GATEKEEPER WARNING] Could not write debug artifact: %s", e)
 
-    def execute_qc_validation(self, initial_test_code: str, max_retries: int = None, debug_tag: str = "candidate", debug_dir: str = None) -> tuple:
-        """Runs Forge against the candidate test suite. Returns (status, forge_output)."""
+    def execute_qc_validation(self, initial_test_code: str, max_retries: int = None, debug_tag: str = "candidate", debug_dir: str = None, legacy: bool = False) -> tuple:
+        """Runs Forge against the candidate test suite. Returns (status, forge_output).
+
+        legacy=True means the target's pragma excludes solc >= 0.8.13, so
+        forge-std cannot compile; suites importing it are healed
+        deterministically instead of burning a doomed forge invocation."""
         if max_retries is None:
             max_retries = config.GATEKEEPER_MAX_RETRIES
+        from domain.solc_compat import LEGACY_HEAL_HINT
         current_test_code = initial_test_code
         
         # ðŸš€ THREAD-SAFE DYNAMIC FILENAMES
@@ -179,6 +194,30 @@ class FoundryGatekeeper:
 
         try:
             for attempt in range(1, max_retries + 1):
+                # 0. LEGACY PRE-CHECK: forge-std imports are a guaranteed
+                # compile failure for sub-0.8.13 targets — heal before ever
+                # invoking forge. Import statements are located in the
+                # comment-masked text (so comments mentioning forge-std can't
+                # trigger a false heal) and checked against the original text,
+                # because the mask blanks string contents.
+                from piyoxml import create_index_mask
+                _masked = create_index_mask(current_test_code)
+                _legacy_import = any(
+                    "forge-std" in current_test_code[m.start():m.end()]
+                    for m in re.finditer(r'\bimport\b[^;]+;', _masked)
+                )
+                if legacy and _legacy_import:
+                    print("      [CEGIS WARNING] Legacy target + forge-std import detected — healing without invoking forge...")
+                    synthetic_error = ("Compiler run failed (deterministic pre-check): the suite imports "
+                                       "forge-std, which requires solc >= 0.8.13, but the target contract's "
+                                       "pragma forbids it.\n" + LEGACY_HEAL_HINT)
+                    if attempt < max_retries and self.verifier_agent:
+                        current_test_code = self.verifier_agent.heal_test_suite(
+                            current_test_code, synthetic_error, legacy=True)
+                        continue
+                    self._dump_debug_artifact(debug_tag, attempt, current_test_code, synthetic_error, debug_dir)
+                    return "compile_failed", synthetic_error
+
                 # 1. Write the payload
                 try:
                     with open(target_file, "w", encoding="utf-8") as f:
@@ -213,7 +252,14 @@ class FoundryGatekeeper:
                         self._dump_debug_artifact(debug_tag, attempt, current_test_code, combined_output, debug_dir)
                         if attempt < max_retries and self.verifier_agent:
                             print(f"      [CEGIS WARNING] Compilation failed. Feeding error back to AI for healing...")
-                            current_test_code = self.verifier_agent.heal_test_suite(current_test_code, combined_output)
+                            heal_error = combined_output
+                            # Legacy targets: the classic failure is a forge-std
+                            # version clash — make the constraint explicit so the
+                            # repair cannot re-introduce the same import.
+                            if legacy and ("forge-std" in combined_output or "0.8.13" in combined_output):
+                                heal_error = combined_output + "\n\n" + LEGACY_HEAL_HINT
+                            current_test_code = self.verifier_agent.heal_test_suite(
+                                current_test_code, heal_error, legacy=legacy)
                             continue
                         else:
                             print("      [QC INCONCLUSIVE] Max CEGIS retries reached. Flagging for human review, NOT discarding.")

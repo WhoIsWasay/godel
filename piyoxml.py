@@ -171,6 +171,8 @@ def process_inner_block(b_type, b_name, inner_start, inner_end, original, masked
         functions_data.append({
             'name': name,
             'type': f_type,
+            'start': f_start,
+            'container': f'{b_type} {b_name}',
             'code': original[real_start:f_end]
         })
         
@@ -205,7 +207,10 @@ def process_inner_block(b_type, b_name, inner_start, inner_end, original, masked
 
     # Format Functions cleanly
     for fd in functions_data:
-        inner_xml.append(f'{indent}    <function name="{fd["name"]}" type="{fd["type"]}">')
+        inner_xml.append(
+            f'{indent}    <function name="{fd["name"]}" type="{fd["type"]}" '
+            f'container="{fd["container"]}" start="{fd["start"]}">'
+        )
         func_code_dedented = textwrap.dedent(fd["code"]).strip()
         func_code_formatted = "\n".join([f"{indent}        {line}" for line in func_code_dedented.splitlines()])
 

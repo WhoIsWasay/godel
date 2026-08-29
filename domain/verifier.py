@@ -3,6 +3,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from domain.config import PROMPTS_DIR
 from domain.extractor import OutputExtractor
 from domain.llm_utils import call_with_retry
+from domain.solc_compat import needs_legacy_harness, legacy_generation_directive, LEGACY_HEAL_HINT
 
 
 _INLINE_SYSTEM_PROMPT = """<verification_engineer_directive>
@@ -104,8 +105,11 @@ class PropertyVerifierAgent:
             raw_report = result_state.get("bug_report", "")
             facts = str(OutputExtractor.parse_slither_json(raw_report, func_name))
 
-        user_content = f"""TARGET CONTRACT FILENAME: {contract_filename}
+        legacy = needs_legacy_harness(contract_code)
+        legacy_block = legacy_generation_directive(contract_code) if legacy else ""
 
+        user_content = f"""TARGET CONTRACT FILENAME: {contract_filename}
+{legacy_block}
 <contract>
 {contract_code}
 </contract>
@@ -127,8 +131,9 @@ Read the contract source inside <contract> tags, parse its true interface bounds
         return self._clean_markdown(response.content.strip())
 
 
-    def heal_test_suite(self, broken_code: str, error_log: str) -> str:
+    def heal_test_suite(self, broken_code: str, error_log: str, legacy: bool = False) -> str:
         """CEGIS loop integration: Feed errors back to the model for self-healing."""
+        legacy_reminder = f"\n\n{LEGACY_HEAL_HINT}" if legacy else ""
         feedback_prompt = f"""The Foundry test code you generated failed to compile. 
 You must fix the errors detailed below and return a corrected, fully compilable version.
 
@@ -137,7 +142,7 @@ You must fix the errors detailed below and return a corrected, fully compilable 
 {broken_code}
 COMPILER ERROR:
 {error_log}
-
+{legacy_reminder}
 Review the original target contract interface, correct the syntax/arguments according to the exact error, and return ONLY the corrected raw Solidity code inside markdown fences."""
         response = call_with_retry(lambda: self.heal_llm.invoke(feedback_prompt))
         return self._clean_markdown(response.content.strip())
