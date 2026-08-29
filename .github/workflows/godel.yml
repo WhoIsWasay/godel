@@ -67,7 +67,10 @@ jobs:
 
       - name: Run Gödel pipeline
         env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          # pipeline.py constructs ChatOpenAI clients at import time; when the
+          # secret is absent (dry-run smoke audits) a placeholder keeps
+          # construction happy — dry-run never makes an LLM call.
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY || 'ci-placeholder-not-used' }}
           GODEL_CONTRACTS_FOLDER: ${{ steps.folder.outputs.path }}
           GODEL_DRY_RUN: ${{ steps.folder.outputs.dry || '0' }}
         run: python main.py --contracts "$GODEL_CONTRACTS_FOLDER"
