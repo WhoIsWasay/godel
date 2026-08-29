@@ -81,22 +81,25 @@ class PropertyGenerator:
         faithfully encode must remain a free/unconstrained variable.
         """
 
-        self.prompt = f"""=== VERIFICATION INTENT ===
-        {intent}
+        self.prompt = f"""<intent>
+{intent}
 
-        === EXPANDED QUERIES ===
-        {formatted_queries}
+=== EXPANDED QUERIES ===
+{formatted_queries}
+</intent>
 
-        === CONTRACT ===
-        {contract}
+<contract>
+{contract}
+</contract>
 
-        === HISTORICAL FINDINGS ===
-        {formatted_findings}
-        {harness_section}
-        === TASK ===
-        Generate Z3 Python code that encodes and tests the above verification intent.
-        Use the exact variable names from the contract. Encode edge cases derived from the findings.
-        Output only the Python code block. No explanation. No prose. No markdown fences."""
+<findings>
+{formatted_findings}
+</findings>
+{harness_section}
+=== TASK ===
+Generate Z3 Python code that encodes and tests the above verification intent.
+Use the exact variable names from the contract. Encode edge cases derived from the findings.
+Output only the Python code block. No explanation. No prose. No markdown fences."""
 
 
 

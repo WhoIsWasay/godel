@@ -1,37 +1,25 @@
 import os
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import SystemMessage, HumanMessage
+from domain.config import PROMPTS_DIR
 from domain.extractor import OutputExtractor
 from domain.llm_utils import call_with_retry
-# <law id="1" title="DYNAMIC IMPORT PROTOCOL">
-#             You must import the target contract under test using the exact filename provided by the system context. 
-#             You MUST strictly use this exact format: import "src/{contract_filename}";
-#             You are strictly FORBIDDEN from using relative paths like "../src/{contract_filename}". Forge is executed from the project root, so relative paths will break the compiler.
-#         </law>
 
-#   <critical_execution_laws>
-#         <law id="1" title="DYNAMIC IMPORT PROTOCOL">
-#             You must import the target contract under test using the exact filename provided by the system context. The import pattern must follow this format precisely:
-#             import "src/{contract_filename}";
-#         </law>
-class PropertyVerifierAgent:
-    def __init__(self, agent_llm, heal_llm=None):
-        self.llm = agent_llm
-        self.heal_llm = heal_llm or agent_llm
-        self.prompt_template = ChatPromptTemplate.from_messages([
-           ("system", """<verification_engineer_directive>
+
+_INLINE_SYSTEM_PROMPT = """<verification_engineer_directive>
     <role_definition>
         You are an elite, deterministic Defensive Verification Engineer specializing in the Foundry testing framework. Your sole objective is to generate a standalone, compilable Solidity property test suite file (`.t.sol`) that verifies an identified protocol vulnerability.
     </role_definition>
 
     <critical_execution_laws>
      <law id="1" title="DYNAMIC IMPORT PROTOCOL">
-            You must import the target contract under test using the exact filename provided by the system context. 
+            You must import the target contract under test using the exact filename provided by the system context.
              You MUST strictly use this exact format: import "src/{contract_filename}";
             You are strictly FORBIDDEN from using relative paths like "../src/{contract_filename}". Forge is executed from the project root, so relative paths will break the compiler.
          </law>
 
-    
-        
+
+
+
         <law id="2" title="ZERO-HALLUCINATION INTERFACE & FUNCTION ALIGNMENT">
             Before instantiating or interacting with the target contract, you must parse the provided source code to map out its exact interfaces:
             - CONSTRUCTOR ALIGNMENT: Inspect the target constructor function signature. Count and verify every input argument. You must pass the exact number and type of arguments required. Do not inject or assume parameters unless they are explicitly declared in the constructor signature.
@@ -41,7 +29,7 @@ class PropertyVerifierAgent:
 
         <law id="3" title="MOCK SETUP AND MANDATORY INITIALIZATION ORDER">
             If the target contract's constructor or functions require external dependencies, abstract contracts, or custom interfaces (e.g., IOracle), you MUST explicitly declare a lightweight, functional Mock contract directly inside the test file (above your test contract suite).
-            
+
             Inside your test suite's `setUp()` function, you must rigidly execute these operations in this exact order:
             1. First, deploy your Mock contracts using the `new` keyword (e.g., `MockOracle mockOracle = new MockOracle();`).
             2. Second, initialize the main contract under test, passing the deployed mock's address into its constructor arguments exactly as required (e.g., `pool = new LendingPool(address(mockOracle));`).
@@ -56,9 +44,9 @@ class PropertyVerifierAgent:
 
         <law id="5" title="OUTPUT ENCAPSULATION CODE RULES">
             - Your output must consist EXCLUSIVELY of valid, clean, and compilable Solidity code enclosed inside standard markdown fences (```solidity ... ```).
-            - Do not append introductory greetings, explanations, descriptions, notes, or concluding conversational prose. 
+            - Do not append introductory greetings, explanations, descriptions, notes, or concluding conversational prose.
         </law>
-        
+
         <law id="6" title="NO STORAGE SLOT INTERFERENCE">
             NEVER guess, speculate, or hardcode literal storage slots (e.g., using `vm.store(address(pool), bytes32(uint256(5)), ...)`). You do not know the compilation layout. Instead, you must manipulate the initial state exclusively using public protocol functions (e.g., calling standard `.deposit()` or transferring tokens directly).
         </law>
@@ -66,7 +54,7 @@ class PropertyVerifierAgent:
         <law id="7" title="STATEFUL INVARIANT DESIGN">
             If the verification mode is set to an invariant property test, you MUST inherit from `StdInvariant`, call `targetContract(address(target))` inside the `setUp()`, and name your verification assertions using the lowercase prefix "invariant_" (e.g., `invariant_solvencyCheck()`).
         </law>
-        
+
         <law id="8" title="NO FOUNDRY TEMPLATE HALLUCINATIONS">
             You are strictly forbidden from importing or referencing default Foundry template files. NEVER output `import {{Counter}} from "../src/Counter.sol";`. NEVER instantiate a `Counter` contract. You must ONLY import the target contract provided in the context.
         </law>
@@ -80,19 +68,27 @@ class PropertyVerifierAgent:
             Prefer this explicit-sequence style whenever the trace provides concrete values; use fuzz/invariant mode only for single-call properties.
         </law>
     </critical_execution_laws>
-</verification_engineer_directive>"""),
-            ("user", """### TARGET CONTRACT CODE:
-{contract_code}
+</verification_engineer_directive>"""
 
-### FINDING DETAILS:
-Target Function: {function_name}
-Verification Mode: {mode}
-Extracted Tool Logs: {extracted_facts}
 
-Please read the target contract source meticulously, parse out its true interface bounds according to the verification_engineer_directive rules, and generate the complete, standalone compilable Foundry property test code (`.t.sol`) that imports "src/{contract_filename}".""")
-        ])
-        
-        
+def _load_verifier_system_prompt() -> str:
+    """Loads verifier_prompt.txt from disk; falls back to inline if unavailable."""
+    try:
+        with open(PROMPTS_DIR / "verifier_prompt.txt", "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        if content:
+            return content
+    except OSError:
+        pass
+    return _INLINE_SYSTEM_PROMPT
+
+
+class PropertyVerifierAgent:
+    def __init__(self, agent_llm, heal_llm=None):
+        self.llm = agent_llm
+        self.heal_llm = heal_llm or agent_llm
+        self.system_prompt = _load_verifier_system_prompt()
+
     def generate_test_suite(self, finding: dict, result_state: dict, contract_code: str, contract_filename: str) -> str:
         func_name = finding.get("target_function", "unknown")
         mode = result_state.get("mode", "standard")
@@ -100,8 +96,6 @@ Please read the target contract source meticulously, parse out its true interfac
         z3_result = result_state.get("z3_result")
         if z3_result and z3_result.get("status") == "sat" and z3_result.get("output"):
             facts = str(OutputExtractor.parse_z3_counterexample(z3_result["output"]))
-            # Phase 2: structured counterexample assignments give exact
-            # attacker-controlled values for the exploit sequence.
             cex = z3_result.get("counterexample") or {}
             if isinstance(cex, dict) and cex.get("assignments"):
                 facts += "\nCONCRETE COUNTEREXAMPLE ASSIGNMENTS (use these exact values in the sequence): " + \
@@ -110,18 +104,27 @@ Please read the target contract source meticulously, parse out its true interfac
             raw_report = result_state.get("bug_report", "")
             facts = str(OutputExtractor.parse_slither_json(raw_report, func_name))
 
-        prompt = self.prompt_template.format_messages(
-            contract_filename=contract_filename,
-            contract_code=contract_code,
-            function_name=func_name,
-            mode=mode,
-            extracted_facts=facts
+        user_content = f"""TARGET CONTRACT FILENAME: {contract_filename}
+
+<contract>
+{contract_code}
+</contract>
+
+<solver_trace>
+Target Function: {func_name}
+Verification Mode: {mode}
+Extracted Tool Logs: {facts}
+</solver_trace>
+
+Read the contract source inside <contract> tags, parse its true interface bounds per the system-prompt laws, and generate the complete standalone Foundry property test code (.t.sol) that imports "src/{contract_filename}"."""
+
+        response = call_with_retry(
+            lambda: self.llm.invoke([
+                SystemMessage(content=self.system_prompt),
+                HumanMessage(content=user_content),
+            ])
         )
-
-        response = call_with_retry(lambda: self.llm.invoke(prompt))
-        content = response.content.strip()
-
-        return self._clean_markdown(content)
+        return self._clean_markdown(response.content.strip())
 
 
     def heal_test_suite(self, broken_code: str, error_log: str) -> str:

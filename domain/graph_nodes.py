@@ -28,16 +28,18 @@ def supervisor_node(state: GraphState, llm_pro):
     with open(config.PROMPTS_DIR / "supervisor_prompt.txt", "r", encoding="utf-8") as f:
         supervisor_prompt = f.read()
 
-    # FIX: Inject the actual contract code so the Supervisor isn't blind!
-    state_summary = f"""
-    TARGET FUNCTION UNDER ANALYSIS: {state.get('current_focus_function')}
-    
-    PROPOSED FINDINGS: 
-    {json.dumps(state.get('findings', []), indent=2)}
-    
-    === TARGET CONTRACT CODE ===
-    {state.get('user_contract', '')}
-    """
+    # Inject the actual contract code and findings using the XML tags
+    # the supervisor prompt's grounding_constraint references.
+    state_summary = f"""TARGET FUNCTION UNDER ANALYSIS: {state.get('current_focus_function')}
+
+<findings>
+{json.dumps(state.get('findings', []), indent=2)}
+</findings>
+
+<contract>
+{state.get('user_contract', '')}
+</contract>
+"""
 
     messages = [
         SystemMessage(content=supervisor_prompt),

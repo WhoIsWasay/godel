@@ -1,8 +1,10 @@
 import os
 import re
 import logging
-from string import Template
+from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_openai import ChatOpenAI
+
+from domain.llm_utils import call_with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -10,22 +12,14 @@ logger = logging.getLogger(__name__)
 class FixerAgent:
 
     _PROMPT_PATH = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "..", "prompts", "fixer_prompt.txt" #HERE
+        os.path.dirname(os.path.abspath(__file__)), "..", "prompts", "fixer_prompt.txt"
     )
 
     def __init__(self, agent: ChatOpenAI):
-        """
-        Initializes the Fixer Agent with the high-reasoning LLM client (llm_pro).
-        """
         self.agent = agent
-        self.prompt_template = self._load_prompt_template()
+        self.system_prompt = self._load_system_prompt()
 
-    def _load_prompt_template(self) -> str:
-        """
-        Loads the prompt template from disk. Returns an empty string (rather than
-        raising) if the file is missing or unreadable, so the agent can fall back
-        to placeholder output instead of crashing at construction time.
-        """
+    def _load_system_prompt(self) -> str:
         try:
             with open(self._PROMPT_PATH, "r", encoding="utf-8") as f:
                 content = f.read()
@@ -40,53 +34,44 @@ class FixerAgent:
             return ""
 
     def generate_remediation(self, finding: dict, state: dict) -> str:
-        """
-        Sends the bug context and solver proof details to the high-reasoning model.
-        Returns a clean, refactored version of the target function block.
-        """
-        # Assemble context strings from the pipeline state
         target_function_name = finding.get("target_function", "unknown")
         bug_intent = finding.get("intent", "No intent specified.")
         invariant_constraint = finding.get("constraint", "No constraint specified.")
         vulnerable_code_block = finding.get("relevant_code", "")
-        solver_trace_log = state.get("bug_report", "No trace generated.")
+        solver_trace_log = state.get("bug_report", "") or ""
         full_contract = state.get("user_contract", "")
 
-        # If the template is empty, output a fallback string until we build the prompt
-        if not self.prompt_template:
+        if not self.system_prompt:
             return f"// Concrete fix placeholder for {target_function_name} (Prompt template not yet implemented)"
 
-        # Formatting execution payload.
-        # Template.safe_substitute is used instead of str.format(): the prompt
-        # template will keep growing (schema examples, sample code blocks, etc.)
-        # and Solidity/JSON snippets are full of literal { } characters. format()
-        # requires every one of those to be manually escaped as {{ }} or it throws
-        # KeyError; Template uses $placeholder syntax so literal braces in the
-        # template need no escaping at all. safe_substitute (vs substitute) also
-        # means a typo'd or missing $placeholder in the template won't crash this
-        # call — it just leaves that token unsubstituted, which is easier to spot
-        # and debug than a hard KeyError mid-pipeline.
+        user_payload = f"""<full_contract_context>
+{full_contract}
+</full_contract_context>
+
+<vulnerable_code_boundary>
+{vulnerable_code_block}
+</vulnerable_code_boundary>
+
+<solver_counterexample_trace>
+{solver_trace_log}
+</solver_counterexample_trace>
+
+<finding_metadata>
+<function_name>{target_function_name}</function_name>
+<intent>{bug_intent}</intent>
+<invariant_constraint>{invariant_constraint}</invariant_constraint>
+</finding_metadata>
+
+Output the corrected `{target_function_name}` function body only, inside ```solidity fences."""
+
         try:
-            formatted_prompt = Template(self.prompt_template).safe_substitute(
-                function_name=target_function_name,
-                intent=bug_intent,
-                constraint=invariant_constraint,
-                vulnerable_code=vulnerable_code_block,
-                solver_trace=solver_trace_log,
-                full_contract_context=full_contract,
+            response = call_with_retry(
+                lambda: self.agent.invoke([
+                    SystemMessage(content=self.system_prompt),
+                    HumanMessage(content=user_payload),
+                ])
             )
-        except Exception as e:
-            return f"// Error formatting Fixer prompt for function {target_function_name}: {str(e)}"
-
-        try:
-            # Invoke deepseek-v4-pro with thinking tokens enabled
-            response = self.agent.invoke(formatted_prompt)
-            raw_content = response.content
-
-            # Clean and isolate the code block if the LLM wraps it in markdown triple backticks
-            cleaned_code = self._extract_clean_solidity(raw_content)
-            return cleaned_code
-
+            return self._extract_clean_solidity(response.content)
         except Exception as e:
             return f"// Error executing Fixer Agent logic for function {target_function_name}: {str(e)}"
 
