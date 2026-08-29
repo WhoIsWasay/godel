@@ -229,6 +229,7 @@ def specifier_node(state: GraphState, generator: PropertyGenerator):
         state["user_contract"],
         rag_findings,
         semantic_harness=state.get("semantic_harness"),
+        repair_feedback=state.get("supervisor_critique"),
     )
     
     z3_code_raw = generator.propertyGeneration()
@@ -246,6 +247,38 @@ def specifier_node(state: GraphState, generator: PropertyGenerator):
             "rag_diagnostics": rag_diag,
             "messages": [AIMessage(content="[SPECIFIER]: Z3 Property Generated.")]
         }
+
+def _handle_unsat_verdict(state: GraphState, updates: dict) -> None:
+    """UNSAT verdict handling. When a deterministic semantic harness exists,
+    probe it for vacuity (an unreachable model makes UNSAT meaningless).
+    Harness-less scripts are covered by the mandatory SANITY sentinel probe
+    enforced in z3_runner, so a plain UNSAT there is trusted."""
+    harness = state.get("semantic_harness")
+    if harness and harness.get("code"):
+        vac_script = compose_reachability_script(harness)
+        vac_result = run_z3(vac_script)
+        if vac_result.get("status") == "sat":
+            # Model satisfiable without property -> genuine proof
+            updates["messages"] = [AIMessage(content="[EXECUTOR]: UNSAT. Property holds safely.")]
+        elif vac_result.get("status") in ("unsat", "error", "inconclusive"):
+            # Model itself is unsatisfiable or could not be checked ->
+            # the UNSAT property result may be vacuous
+            reason = (
+                "harness model is unsatisfiable (guards contradict bounds "
+                "or transitions) — property holds vacuously, NOT a real proof"
+                if vac_result.get("status") == "unsat"
+                else f"vacuity probe inconclusive ({vac_result.get('error', 'unknown')})"
+            )
+            updates["vacuity_status"] = "vacuous"
+            updates["vacuity_reason"] = reason
+            print(f"      [VACUITY] {state.get('current_focus_function')}: {reason}")
+            updates["messages"] = [AIMessage(
+                content=f"[EXECUTOR]: UNSAT but VACUOUS — {reason}")]
+        else:
+            updates["messages"] = [AIMessage(content="[EXECUTOR]: UNSAT. Property holds safely.")]
+    else:
+        updates["messages"] = [AIMessage(content="[EXECUTOR]: UNSAT. Property holds safely.")]
+
 
 def executor_node(state: GraphState, cegis_tool: CEGIS):
     """Executes the generated Z3 property."""
@@ -279,31 +312,21 @@ def executor_node(state: GraphState, cegis_tool: CEGIS):
     elif result["status"] == "unsat":
         remaining = state.get("findings", []) or []
         updates["findings"] = remaining[1:] if remaining else []
-        harness = state.get("semantic_harness")
-        if harness and harness.get("code"):
-            vac_script = compose_reachability_script(harness)
-            vac_result = run_z3(vac_script)
-            if vac_result.get("status") == "sat":
-                # Model satisfiable without property -> genuine proof
-                updates["messages"] = [AIMessage(content="[EXECUTOR]: UNSAT. Property holds safely.")]
-            elif vac_result.get("status") in ("unsat", "error", "inconclusive"):
-                # Model itself is unsatisfiable or could not be checked ->
-                # the UNSAT property result may be vacuous
-                reason = (
-                    "harness model is unsatisfiable (guards contradict bounds "
-                    "or transitions) — property holds vacuously, NOT a real proof"
-                    if vac_result.get("status") == "unsat"
-                    else f"vacuity probe inconclusive ({vac_result.get('error', 'unknown')})"
-                )
-                updates["vacuity_status"] = "vacuous"
-                updates["vacuity_reason"] = reason
-                print(f"      [VACUITY] {state.get('current_focus_function')}: {reason}")
-                updates["messages"] = [AIMessage(
-                    content=f"[EXECUTOR]: UNSAT but VACUOUS — {reason}")]
-            else:
-                updates["messages"] = [AIMessage(content="[EXECUTOR]: UNSAT. Property holds safely.")]
-        else:
-            updates["messages"] = [AIMessage(content="[EXECUTOR]: UNSAT. Property holds safely.")]
+        _handle_unsat_verdict(state, updates)
+    elif result["status"] == "vacuous":
+        # SANITY probe failed: the base model is over-constrained, so every
+        # check was vacuously UNSAT. Keep the finding queued and feed explicit
+        # repair guidance back to the specifier — never accept this as safe.
+        updates["supervisor_critique"] = (
+            "Z3 VACUOUS MODEL: "
+            + (result.get("error") or "the SANITY probe returned unsat.")
+            + " The preconditions contradict each other or over-constrain the "
+            "state so no reachable model exists. Re-derive each state "
+            "precondition from the contract code, ensure the base model alone "
+            "is satisfiable, and regenerate the property."
+        )
+        updates["messages"] = [AIMessage(
+            content="[EXECUTOR]: VACUOUS — over-constrained base model. Regenerating property.")]
     else:
         updates["supervisor_critique"] = f"Z3 Syntax/Execution Error:\n{result['error']}"
         updates["messages"] = [AIMessage(content="[EXECUTOR]: ERROR during execution. Needs refinement.")]

@@ -22,6 +22,27 @@
         <rule>If the FINDINGS reference patterns from external contracts, map them to the CURRENT contract's variable names before encoding. Never copy external variable names into Z3 code.</rule>
     </grounding_constraint>
 
+    <property_calibration>
+        Your single most important quality obligation: the property must be CALIBRATED — neither LOOSE nor NICHE. Uncalibrated properties are the #1 source of missed bugs.
+
+        <class name="LOOSE (false negative — the worst failure)">
+            The property omits the adversarial precondition, so it checks the invariant only under safe-by-construction states. Z3 returns UNSAT and the pipeline declares the contract safe even though the bug is real.
+            Example (LOOSE): checking `amount > 0 => shares > 0` WITHOUT modeling that totalAssets can be donation-inflated. Under normal state this trivially holds → vacuous UNSAT → real bug missed.
+        </class>
+
+        <class name="NICHE (hallucinated — also unacceptable)">
+            The property asserts facts, caps, fees, or variables that do not exist in the contract code. It tests a contract that was never written. Either Z3 errors, or the supervisor rejects it.
+            Example (NICHE): asserting `require(fee <= MAX_FEE)` when no fee or MAX_FEE exists anywhere in the CONTRACT input.
+        </class>
+
+        <class name="CALIBRATED (the only acceptable output)">
+            1. Arithmetic is copied VERBATIM from the target function (same operators, same order, same types).
+            2. Exactly the adversarial precondition(s) from step 2.5 are added — no more, no less. Every precondition must map to a real adversary action reachable in the contract (donation, first depositor, flash loan, fee accrual, time passage).
+            3. The base model (bounds + preconditions, before the violation assertion) is satisfiable — you MUST prove this with the SANITY probe.
+            Self-test before output: "If I delete the violation assertion, can the model still be satisfied?" If NO → your preconditions contradict each other → fix them or the run will be rejected as VACUOUS.
+        </class>
+    </property_calibration>
+
     <execution_protocol>
         <step number="1" title="EXTRACT">
             Read the contract. You are verifying ONLY the function named in INTENT's target function — do not model, reference, or encode constraints from any other function in the contract, even if it touches the same state variables. Identify the exact variables, mappings, and types relevant to that one function's stated intent. Do not generalize. Use the actual names from the contract code.
@@ -84,6 +105,15 @@
 
         <step number="4" title="ENCODE THE PROPERTY">
             Negate the property. You are searching for a counterexample — a state where the invariant is violated. If Z3 returns SAT, a bug exists. If UNSAT, the property holds under your model.
+
+            MANDATORY SANITY PROBE (machine-checked — scripts without it are REJECTED before execution):
+            After adding the bounds and adversarial preconditions but BEFORE adding the violation condition, prove the base model is reachable:
+            ```
+            s.push()
+            print("SANITY:", s.check())
+            s.pop()
+            ```
+            If the sanity check would print `SANITY: unsat`, your preconditions contradict each other — the executor will reject the whole run as VACUOUS. Fix the preconditions instead.
 
             CRITICAL RULE: Your negated property MUST include the state preconditions from step 2.5.
             - WRONG: `s.add(And(amount > 0, shares == 0))` — too generic, Z3 returns UNSAT because this is safe under normal conditions
@@ -242,6 +272,11 @@
             s.add(UGT(amount, 0), ULT(amount, 10**6))
             s.add(UGE(totalAssets_0, 0), ULT(totalAssets_0, 10**6))
             s.add(UGE(totalSupply_0, 0), ULT(totalSupply_0, 10**6))
+
+            # MANDATORY SANITY PROBE: base model must be reachable
+            s.push()
+            print("SANITY:", s.check())
+            s.pop()
 
             shares = UDiv(UMul(amount, totalSupply_0), totalAssets_0)
 

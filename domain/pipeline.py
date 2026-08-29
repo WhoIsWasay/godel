@@ -142,7 +142,11 @@ property_verifier = PropertyVerifierAgent(agent_llm=llm_pro, heal_llm=llm_repair
 gatekeeper = FoundryGatekeeper(project_root=str(config.FOUNDRY_ROOT), verifier_agent=property_verifier)
 fixer = FixerAgent(agent=llm_fixer)
 formatter = SubmissionFormatter()
-cegis = CEGIS(agent=llm_repair, run_z3_tool=run_z3)
+# strict=True: LLM-generated property scripts must pass the structural
+# quality lint (SANITY probe, s.add/s.check presence) before execution —
+# degenerate scripts get rejected with repair feedback instead of producing
+# vacuous "safe" verdicts. Harness/vacuity probes call run_z3 directly.
+cegis = CEGIS(agent=llm_repair, run_z3_tool=lambda code: run_z3(code, strict=True))
 
 
 # ==========================================
@@ -271,6 +275,25 @@ def is_read_only_function(analysis: dict | None, func_name: str) -> bool:
     )
 
 
+_TRANSIENT_MARKERS = (
+    "connection", "getaddrinfo", "timeout", "timed out",
+    "connectionerror", "connecterror", "reset by peer",
+    # Rate limiting / capacity exhaustion — the other common transient class.
+    # Without these, a burst of 429s during parallel function graphs kills the
+    # analysis permanently instead of retrying after backoff.
+    "429", "rate limit", "rate_limit", "ratelimit", "too many requests",
+    "quota", "overloaded", "server overload", "capacity",
+    "502", "503", "bad gateway", "service unavailable", "server error",
+)
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    """True when the exception looks like a transient infrastructure failure
+    (network or provider rate limiting) worth retrying, False for logic bugs."""
+    exc_text = str(exc).lower()
+    return any(marker in exc_text for marker in _TRANSIENT_MARKERS)
+
+
 def process_function(func, raw_solidity_code, stem, readme, env_setup, interfaces, state_vars, app,
                      static_analysis=None):
     import time as _time
@@ -281,12 +304,7 @@ def process_function(func, raw_solidity_code, stem, readme, env_setup, interface
             return _process_function_inner(func, raw_solidity_code, stem, readme, env_setup,
                                            interfaces, state_vars, app, static_analysis)
         except Exception as exc:
-            exc_text = str(exc).lower()
-            is_transient = any(marker in exc_text for marker in (
-                "connection", "getaddrinfo", "timeout", "timed out",
-                "connectionerror", "connecterror", "reset by peer",
-            ))
-            if is_transient and attempt < max_function_retries:
+            if _is_transient_error(exc) and attempt < max_function_retries:
                 delay = 5.0 * (attempt + 1)
                 print(f"      [FUNCTION RETRY] {func_name} failed with transient error "
                       f"({type(exc).__name__}). Retrying in {delay}s "
@@ -411,7 +429,7 @@ def route_after_specifier(state: GraphState) -> str:
     # SUPERVISOR_MAX_ITERATIONS slots and can restart the whole hunter loop).
     res = state.get("z3_result", {}) or {}
     last_status = res.get("status")
-    if state.get("supervisor_critique") and last_status not in ("error", "inconclusive"):
+    if state.get("supervisor_critique") and last_status not in ("error", "inconclusive", "vacuous"):
         return "supervisor"
     return "executor"
 
@@ -419,9 +437,10 @@ def route_after_specifier(state: GraphState) -> str:
 def route_after_executor(state: GraphState) -> str:
     res = state.get("z3_result", {}) or {}
     status = res.get("status")
-    if status in ("error", "inconclusive"):
+    if status in ("error", "inconclusive", "vacuous"):
         # inconclusive = script ran but printed no unambiguous verdict sentinel;
-        # both cases need a regenerated/refined property, not a verdict.
+        # vacuous = SANITY probe failed (over-constrained base model). Neither
+        # is a verdict — all need a regenerated/refined property.
         if state.get("executor_runs", 0) >= config.EXECUTOR_MAX_ITERATIONS:
             return END
         return "specifier"
@@ -510,6 +529,52 @@ def _timeout_finding(contract_name: str, func_name: str) -> dict:
         {"contract_name": contract_name, "z3_code": "", "z3_result": None, "iterations": 0},
         "", "", "", "timeout",
     )
+
+
+def _error_finding(contract_name: str, func_name: str, exc: Exception) -> dict:
+    """Visible artifact for a function whose analysis graph RAISED. Without
+    this, exceptions made functions silently vanish from the report — the
+    exact failure mode that dropped findings in the PoolTogether M-01 case."""
+    detail = str(exc)[:300]
+    return build_finding(
+        {"target_function": func_name, "severity_guess": "info",
+         "intent": f"Analysis failed ({type(exc).__name__}): {detail}. "
+                   f"This function was NOT verified — treat as unanalyzed."},
+        {"contract_name": contract_name, "z3_code": "", "z3_result": None, "iterations": 0},
+        "", "", "", "graph_error",
+    )
+
+
+def _incomplete_finding(contract_name: str, func_name: str, reason: str) -> dict:
+    """Visible artifact for analyses that aborted without a final verdict
+    (retries exhausted, unparseable hunter output, vacuous proof, unresolved
+    findings still queued). Distinguishes 'we could not finish' from 'safe'."""
+    return build_finding(
+        {"target_function": func_name, "severity_guess": "info",
+         "intent": f"Analysis incomplete — {reason}. NOT a safety verdict."},
+        {"contract_name": contract_name, "z3_code": "", "z3_result": None, "iterations": 0},
+        "", "", "", "analysis_incomplete",
+    )
+
+
+def _should_flag_incomplete(final_state: dict) -> str | None:
+    """Returns a human-readable reason string when the terminal graph state
+    represents an aborted/incomplete analysis rather than a genuine verdict,
+    else None. Ironclad guarantee: results contain only verified bugs,
+    proven-safe verdicts, or explicit incomplete/error artifacts."""
+    if final_state.get("hunter_parse_error") and not final_state.get("findings"):
+        return "bug hunter output remained unparseable after retries"
+    if final_state.get("findings"):
+        return f"{len(final_state['findings'])} proposed finding(s) left unprocessed when the graph aborted"
+    res = final_state.get("z3_result", {}) or {}
+    if (final_state.get("executor_runs", 0) >= config.EXECUTOR_MAX_ITERATIONS
+            and res.get("status") in ("error", "inconclusive", "vacuous")):
+        return f"executor exhausted {config.EXECUTOR_MAX_ITERATIONS} retries without a verdict"
+    if final_state.get("vacuity_status") == "vacuous":
+        return f"UNSAT verdict was vacuous ({final_state.get('vacuity_reason', 'model unreachable')})"
+    if res.get("status") == "vacuous":
+        return "base model was over-constrained (SANITY probe UNSAT) — no real verdict produced"
+    return None
 
 
 def _classify_terminal_state(final_state: dict) -> str:
@@ -640,6 +705,9 @@ def run_pipeline(contract_folder: str = None) -> list:
                 except Exception as exc:
                     logger.error("[GRAPH ERROR] %s raised an exception: %s", func_name, exc)
                     traceback.print_exc()
+                    # Ironclad rule: a raised graph must still surface in the
+                    # report, or the function silently drops from the audit.
+                    results.append(_error_finding(stem, func_name, exc))
         except concurrent.futures.TimeoutError:
             # Salvage: futures that finished between the last as_completed yield
             # and the timeout still hold valid results — collect them instead of
@@ -654,6 +722,8 @@ def run_pipeline(contract_folder: str = None) -> list:
                         continue
                     except Exception as exc:
                         logger.error("[GRAPH ERROR] %s raised an exception during salvage: %s", func_name, exc)
+                        results.append(_error_finding(stem, func_name, exc))
+                        continue
                 if not future.done():
                     logger.warning("[GRAPH TIMEOUT] %s exceeded the per-function timeout.", func_name)
                     results.append(_timeout_finding(stem, func_name))
@@ -704,6 +774,12 @@ def _collect_future_result(future, func_name: str, stem: str, results: list):
             bug.get("forge_output", ""),
             bug.get("qc_status", ""),
         ))
+
+    if bugs_found == 0 and not config.is_dry_run():
+        reason = _should_flag_incomplete(final_state)
+        if reason:
+            print(f"      [IRONCLAD] {focus_func}: surfacing incomplete-analysis artifact ({reason})")
+            results.append(_incomplete_finding(stem, focus_func, reason))
 
 
 def run_pipeline_code(contract_code: str, readme: str = "") -> list:

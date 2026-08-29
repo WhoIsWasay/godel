@@ -53,7 +53,8 @@ class PropertyGenerator:
 
 
     def build_prompt(self, expansion: dict, contract: str, findings: list[dict],
-                     semantic_harness: dict | None = None) -> None:
+                     semantic_harness: dict | None = None,
+                     repair_feedback: str | None = None) -> None:
         intent = expansion["intent"]
         queries = expansion["queries"]
         formatted_queries = "\n".join(f"- {q}" for q in queries)
@@ -81,6 +82,16 @@ class PropertyGenerator:
         faithfully encode must remain a free/unconstrained variable.
         """
 
+        repair_section = ""
+        if repair_feedback:
+            repair_section = f"""
+<repair_feedback>
+{repair_feedback}
+</repair_feedback>
+Your PREVIOUS Z3 script was rejected for the reason above. Diagnose it first,
+then generate a corrected script that addresses exactly that failure while
+keeping the property faithful to the contract code."""
+
         self.prompt = f"""<intent>
 {intent}
 
@@ -95,7 +106,7 @@ class PropertyGenerator:
 <findings>
 {formatted_findings}
 </findings>
-{harness_section}
+{harness_section}{repair_section}
 === TASK ===
 Generate Z3 Python code that encodes and tests the above verification intent.
 Use the exact variable names from the contract. Encode edge cases derived from the findings.
