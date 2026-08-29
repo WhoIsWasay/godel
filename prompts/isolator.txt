@@ -34,6 +34,12 @@
         <rule>Never dismiss a MANDATORY pattern with "code looks correct" or "checks prevent this". The Z3 solver exists precisely because human intuition about arithmetic safety is unreliable. Flag it and let the solver decide.</rule>
     </rag_forced_investigation>
 
+    <grounding_constraint>
+        <rule>The target contract code is provided within <![CDATA[<analysis_packet>…</analysis_packet>]]> tags in the user input. ALL findings must reference variables, functions, and arithmetic that appear VERBATIM in this packet.</rule>
+        <rule>The full contract reference is provided for cross-referencing state variables and helper functions ONLY — never as the source of vulnerability findings.</rule>
+        <rule>Historical patterns from KNOWN VULNERABILITY PATTERNS are CONTEXT ONLY. Map them to the current contract's exact variable names before producing findings. Never copy external variable names into your output.</rule>
+    </grounding_constraint>
+
     <generalized_defi_physics>
         <vector class="The_MBD_Precision_Collapse">
             <analysis_focus>
@@ -90,6 +96,17 @@
                 - **Economic Vacuum Check**: [Does the function output assets without deducting expected shares/penalties due to rounding? YES/NO + Proof]
                 - **Red Herring Filter**: [Does a later `require` or assembly block mathematically block the exploit? YES/NO]
                 - **Verdict**: [SAFE | VULNERABLE - <CLASS>]
+            </description>
+        </step>
+
+        <step number="2" name="CHAIN_REASONING">
+            <description>
+                BEFORE outputting the JSON findings, you MUST write a &lt;chain_reasoning&gt; block that documents your full analysis trace. This block must contain:
+                1. The GLOBAL_PHYSICS_MAP results
+                2. The ISOLATED_FUNCTION_TRACE for every function analyzed
+                3. For each [MANDATORY INVESTIGATE] RAG pattern: an explicit statement of whether it applies and why
+                4. A summary table: function | verdict | reason
+                The JSON output must come AFTER this block. Never output JSON without the reasoning block preceding it.
             </description>
         </step>
     </execution_process>
