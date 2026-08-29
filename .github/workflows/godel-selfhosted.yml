@@ -1,0 +1,73 @@
+name: Gödel Audit (Self-Hosted)
+
+# Runs the audit on the SELF-HOSTED runner on Wasay's PC, so the local
+# infrastructure (ParadeDB :5433, Ollama :11434, foundry toolchain) is
+# reachable. Dispatch-only on purpose: every run spends LLM credits, so it
+# never fires automatically on push/PR.
+
+on:
+  workflow_dispatch:
+    inputs:
+      contract_folder:
+        description: "Folder of .sol files to audit. Use ABSOLUTE paths for local-only folders (Fv-audits is gitignored), e.g. C:/Users/AbdulWasay/Desktop/Ai Prototype/Fv-audits/sukukfi"
+        required: true
+        default: "C:/Users/AbdulWasay/Desktop/Ai Prototype/Fv-audits/sukukfi"
+        type: string
+      dry_run:
+        description: "Dry run (no LLM credits — static analysis only)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: [self-hosted, windows]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # No foundry-toolchain step here: forge is already installed on the PC.
+      # If `doctor` reports forge missing, add %USERPROFILE%\.foundry\bin to
+      # the runner service's PATH.
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Preflight doctor
+        run: python main.py --doctor
+
+      - name: Run Gödel pipeline
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          GODEL_CONTRACTS_FOLDER: ${{ inputs.contract_folder }}
+          GODEL_DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+        run: python main.py --contracts "$GODEL_CONTRACTS_FOLDER"
+
+      - name: Render reports
+        run: python render.py
+
+      - name: Count findings
+        id: summary
+        run: |
+          COUNT=$(find output/submissions -name finding.json 2>/dev/null | wc -l | tr -d ' ')
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Verified findings: $COUNT"
+
+      - name: Upload findings artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: godel-findings-selfhosted
+          path: |
+            output/submissions/
+            output/rendered/
