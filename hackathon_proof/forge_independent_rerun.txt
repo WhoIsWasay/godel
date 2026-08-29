@@ -1,8 +1,0 @@
-
-Failing tests:
-Encountered 1 failing test in test/RemoveNftPoC.t.sol:PropertyTest
-[FAIL: EvmError: Revert] test_removeNft_invariant() (gas: 197538)
-
-Encountered a total of 1 failing tests, 0 tests succeeded
-
-Tip: Run `forge test --rerun` to retry only the 1 failed test
