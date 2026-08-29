@@ -1,11 +1,18 @@
 import hashlib
 import json
 import re
+import threading
 from difflib import SequenceMatcher
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from domain import config
 from domain.config import PROMPTS_DIR
-from domain.llm_utils import call_with_retry
+from domain.llm_utils import EmptyResponseError, call_with_retry
+
+# Process-wide throttle on simultaneous LLM invokes. A burst of concurrent
+# hunter calls once hit a provider episode of instant empty-200 responses;
+# capping concurrency keeps load on the provider bounded.
+_LLM_SEMAPHORE = threading.Semaphore(max(1, config.LLM_CONCURRENCY))
 
 
 class Inspector:
@@ -21,15 +28,24 @@ class Inspector:
         self.compositor_agent = compositor_llm
 
     def _invoke(self, agent, system_prompt: str, user_input: str) -> str:
-        response = call_with_retry(
-            lambda: agent.invoke(
-                [
-                    SystemMessage(content=system_prompt),
-                    HumanMessage(content=user_input),
-                ]
-            )
-        )
-        return response.content.strip()
+        def _call():
+            with _LLM_SEMAPHORE:
+                response = agent.invoke(
+                    [
+                        SystemMessage(content=system_prompt),
+                        HumanMessage(content=user_input),
+                    ]
+                )
+            content = (response.content or "").strip()
+            if not content:
+                # An HTTP-200 with no content is a transient provider fault,
+                # NOT a real "no findings" answer. Retry it.
+                raise EmptyResponseError(
+                    "LLM returned empty content — treating as transient provider fault"
+                )
+            return content
+
+        return call_with_retry(_call)
 
     def run(self, xml_code: str, readme: str = "") -> dict:
         # Pass 1 — Isolator x3

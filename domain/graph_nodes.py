@@ -14,7 +14,7 @@ from domain.gatekeeper import FoundryGatekeeper
 from domain.fixer import FixerAgent
 from domain.formatter import SubmissionFormatter
 from domain.schema import build_finding
-from domain.llm_utils import call_with_retry
+from domain.llm_utils import EmptyResponseError, call_with_retry
 from domain.semantics import compose_reachability_script
 from domain.z3_runner import run_z3
 import uuid
@@ -159,7 +159,20 @@ A <cfg_abstraction> block may be present inside the isolation packet. It is DETE
             "no markdown fences beyond ```json, no trailing commas, all strings double-quoted."
         )
 
-    raw_response = inspector._invoke(inspector.isolator_agent, inspector.isolator_prompt, input_text)
+    try:
+        raw_response = inspector._invoke(inspector.isolator_agent, inspector.isolator_prompt, input_text)
+    except EmptyResponseError as e:
+        # Low-level retries exhausted on empty provider responses. This must
+        # never masquerade as a clean safety verdict — flag it so routing
+        # retries at graph level or aborts as analysis_failed.
+        logger.error("[BUG HUNTER EMPTY RESPONSE] %s", e)
+        print(f"      [BUG HUNTER ERROR] Isolator returned only empty responses — flagged as analysis failure, NOT as 'safe'.")
+        return {
+            "findings": [],
+            "hunter_parse_error": f"Isolator returned only empty responses after retries: {e}",
+            "hunter_retries": retry_n + 1,
+            "messages": [AIMessage(content="[BUG HUNTER ERROR]: Empty provider responses flagged as analysis failure.")],
+        }
     
     # --- ROBUST JSON EXTRACTION ---
     findings = []

@@ -16,6 +16,15 @@ _NON_RETRYABLE_TEXT = (
 )
 
 
+class EmptyResponseError(Exception):
+    """Provider returned HTTP success but empty content.
+
+    Observed as a transient DeepSeek episode where every concurrent call got
+    an instant 200 with no content. No status_code and no non-retryable text
+    marker, so call_with_retry treats it as transient and retries.
+    """
+
+
 def _status_code(exc: Exception):
     return getattr(exc, "status_code", None)
 

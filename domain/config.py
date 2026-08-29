@@ -87,6 +87,10 @@ FUNCTION_MAX_RETRIES       = _env_int("GODEL_FUNCTION_MAX_RETRIES", 2)
 # ==========================================
 PER_FUNCTION_TIMEOUT = _env_float("GODEL_PER_FUNCTION_TIMEOUT", 1200.0)
 MAX_WORKERS          = _env_int("GODEL_MAX_WORKERS", 8)
+# Cap on simultaneous LLM invokes across all parallel graph threads. A burst
+# of 8 concurrent hunter calls once triggered a provider episode of instant
+# empty-200 responses; throttling keeps load on the provider bounded.
+LLM_CONCURRENCY      = _env_int("GODEL_LLM_CONCURRENCY", 3)
 
 # Opt-in read-only fast path (default OFF so default coverage is unchanged).
 # When enabled, functions with no storage writes, no external calls and not
