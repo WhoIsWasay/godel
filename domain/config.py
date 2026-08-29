@@ -103,6 +103,14 @@ LLM_CONCURRENCY      = _env_int("GODEL_LLM_CONCURRENCY", 3)
 # longer audited.
 SKIP_READONLY_FUNCTIONS = os.environ.get("GODEL_SKIP_READONLY", "0") in ("1", "true", "True")
 
+# Compositional verification phase (default ON): after the per-function graphs
+# finish, one fast LLM call proposes contract-wide invariants from STATIC FACTS
+# only; Z3 then proves/refutes each across ALL functions locally (no further
+# credits). Broken invariants merge into the main results list. Set
+# GODEL_DISCOVERY=0 to run the classic per-function audit alone.
+RUN_DISCOVERY = os.environ.get("GODEL_DISCOVERY", "1") in ("1", "true", "True")
+DISCOVERY_MAX_INVARIANTS = _env_int("GODEL_DISCOVERY_MAX", 4)
+
 # Tool timeouts (previously hardcoded in z3_runner.py / gatekeeper.py)
 Z3_TIMEOUT_SECONDS   = _env_float("GODEL_Z3_TIMEOUT", 30.0)
 FORGE_TIMEOUT_SECONDS = _env_float("GODEL_FORGE_TIMEOUT", 45.0)

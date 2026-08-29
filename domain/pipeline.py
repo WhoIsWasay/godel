@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import json
 import logging
 import tempfile
 import traceback
@@ -34,7 +35,7 @@ from domain.graph_nodes import (
     fixer_node,
 )
 from domain.z3_runner import run_z3
-from domain.schema import build_finding
+from domain.schema import build_finding, normalize_counterexample
 from Infrastructure.postgres import warmup_rag
 
 sys.stdout.reconfigure(encoding='utf-8')
@@ -642,6 +643,76 @@ def _classify_terminal_state(final_state: dict) -> str:
     return "ended without verification (no Z3 verdict recorded)"
 
 
+def _discovery_finding(stem: str, broken: dict) -> dict:
+    """Adapts a machine-verified broken invariant (discovery phase) into the
+    same FindingSchema shape the graph pipeline produces, so compositional
+    results land in the main audit summary/submission like any verified bug."""
+    violated = broken.get("violated_by") or ["contract-level"]
+    func = violated[0]
+    cex = {}
+    for c in broken.get("counterexamples", []):
+        if c.get("function") == func and c.get("assignments"):
+            cex = c["assignments"]
+            break
+    if not cex and broken.get("counterexamples"):
+        cex = broken["counterexamples"][0].get("assignments", {})
+
+    finding = {
+        "target_function": func,
+        "severity_guess": "high",
+        "intent": (f"Contract invariant broken: '{broken['invariant']}' — violated by "
+                   f"{', '.join(violated)} with a machine-found concrete counterexample "
+                   f"(Z3 induction step over the deterministic static-analysis model)"),
+        "constraint": broken["invariant"],
+        "relevant_code": broken["invariant"],
+    }
+    state = {"contract_name": stem, "z3_code": "", "z3_result": None, "iterations": 0}
+    built = build_finding(finding, state, "", "", "", "broken_invariant")
+    built["counterexample"] = normalize_counterexample(cex)
+    built["metadata"]["status"] = "broken_invariant"
+    built["metadata"]["source"] = "discovery"
+    built["metadata"]["violated_by"] = violated
+    return built
+
+
+def _run_discovery_phase(stem: str, static_analysis: dict) -> list:
+    """Phase C (compositional): one fast LLM call proposes contract-wide
+    invariants from STATIC FACTS only; Z3 proves/refutes each across ALL
+    public functions locally (zero further credits). Broken invariants become
+    schema-shaped findings merged into the main results list; the full report
+    lands in output/reports/."""
+    from domain.discovery import discover_invariants, default_discovery_llm
+
+    print(f"\n=== DISCOVERY PHASE: {stem} (compositional invariant sweep) ===")
+    result = discover_invariants(static_analysis, default_discovery_llm(),
+                                 max_invariants=config.DISCOVERY_MAX_INVARIANTS)
+
+    for p in result["proven"]:
+        print(f"  [DISCOVERY] PROVEN       {p['invariant']}   [{p['verdict']}]")
+    for b in result["broken"]:
+        print(f"  [DISCOVERY] BROKEN       {b['invariant']}   violated by {b['violated_by']}")
+    for i in result["inconclusive"]:
+        print(f"  [DISCOVERY] INCONCLUSIVE {i['invariant']}   [{i['verdict']}]")
+    if result["rejected"]:
+        print(f"  [DISCOVERY] {len(result['rejected'])} proposal(s) rejected by "
+              f"symbol/syntax validation (never reached the solver)")
+
+    with open(config.REPORTS_FOLDER / f"{stem}_discovery.json", "w",
+              encoding="utf-8") as fh:
+        json.dump(result, fh, indent=2)
+
+    findings = []
+    for idx, b in enumerate(result["broken"], 1):
+        built = _discovery_finding(stem, b)
+        findings.append(built)
+        with open(config.FINDINGS_FOLDER / f"{stem}_invfinding_{idx}.json", "w",
+                  encoding="utf-8") as fh:
+            json.dump(built, fh, indent=2)
+    print(f"  [DISCOVERY] {len(result['proven'])} proven | {len(result['broken'])} broken | "
+          f"{len(result['inconclusive'])} inconclusive | {len(result['rejected'])} rejected")
+    return findings
+
+
 def run_pipeline(contract_folder: str = None) -> list:
     """Runs the full audit graph over a folder of .sol files and returns
     a list of FindingSchema dicts (one per verified finding)."""
@@ -786,6 +857,19 @@ def run_pipeline(contract_folder: str = None) -> list:
                     results.append(_timeout_finding(stem, func_name))
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
+
+        # Phase C (compositional): contract-wide invariant discovery. Runs
+        # AFTER the per-function graphs so its findings merge into the same
+        # results list and land in the audit summary. One fast LLM proposal
+        # call + local Z3 sweep; non-fatal — a discovery failure must never
+        # sink the per-function verdicts already collected.
+        if config.RUN_DISCOVERY and static_analysis and not config.is_dry_run():
+            try:
+                results.extend(_run_discovery_phase(stem, static_analysis))
+            except Exception as exc:
+                logger.error("[DISCOVERY] phase failed for %s (non-fatal): %s", stem, exc)
+                print(f"  [DISCOVERY] {stem}: phase failed — non-fatal "
+                      f"({type(exc).__name__}: {str(exc)[:200]})")
 
     print("\n" + "=" * 50 + "\n=== SYSTEM PIPELINE EXECUTION COMPLETE ===\n" + "=" * 50)
     return results
