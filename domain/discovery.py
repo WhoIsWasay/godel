@@ -76,7 +76,7 @@ def _union_keys(analysis: dict) -> list[str]:
             keys.extend(h["symbols"].keys())
     seen, uniq = set(), []
     for k in keys:
-        if k not in seen:
+        if k not in seen and not k.startswith("loc_"):
             seen.add(k)
             uniq.append(k)
     return uniq
