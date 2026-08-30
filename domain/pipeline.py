@@ -266,8 +266,17 @@ def collect_sol_files(folder: str) -> list:
     # the whole process into an isolated tmpdir while Slither runs, so any
     # thread resolving a relative path during that window would read from the
     # wrong directory.
+    #
+    # Skip installed dependency directories on Foundry projects — they are
+    # never the auditable surface, and walking into forge-std adds 50+
+    # irrelevant .sol files to the fan-out.
+    is_foundry_project = os.path.isfile(os.path.join(folder, "foundry.toml"))
+    skip_dirs = {".git", "node_modules"}
+    if is_foundry_project:
+        skip_dirs.add("lib")
     sol_files = []
-    for root, _, files in os.walk(folder):
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
         for file in sorted(files):
             if file.endswith(".sol"):
                 sol_files.append(os.path.abspath(os.path.join(root, file)))
