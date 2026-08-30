@@ -179,10 +179,22 @@ def bug_hunter_node(state: GraphState, inspector: Inspector):
                 rag_context += "\n".join(lines)
     except Exception as e:
         logger.warning("hunter RAG retrieval failed (non-fatal): %s", e)
-    
+
+    # --- Compositional context: cross-function state flow analysis ---
+    compositional_context = ""
+    try:
+        from domain.abstracter import render_compositional_context
+        static_analysis = state.get("slither_result")
+        if static_analysis:
+            compositional_context = render_compositional_context(static_analysis, focus_func)
+            if compositional_context:
+                logger.info("[BUG HUNTER] Compositional context injected for %s", focus_func)
+    except Exception as e:
+        logger.warning("compositional context generation failed (non-fatal): %s", e)
+
     # Inject full contract reference, but STRICTLY bound the AI to the focus function
     input_text = f"""[CRITICAL INSTRUCTION]
-You are actively auditing the function named: `{focus_func}`. 
+You are actively auditing the function named: `{focus_func}`.
 You MUST strictly evaluate this specific function. Do NOT report vulnerabilities found in other parts of the contract. The FULL CONTRACT REFERENCE is provided ONLY so you can cross-reference state variables and view/pure helpers.
 
 A <cfg_abstraction> block may be present inside the isolation packet. It is DETERMINISTIC ground truth produced by a static analyzer (Slither): exact branch conditions, storage reads/writes, external calls, loop counts and High/Medium detector signals for this function (+callees). Your analysis MUST be consistent with it:
@@ -191,6 +203,7 @@ A <cfg_abstraction> block may be present inside the isolation packet. It is DETE
 - Treat detector <signal> entries as PRIORS to investigate, not as findings by themselves.
 - If the block is absent or truncated, proceed from source only — do not invent CFG facts.
 
+{compositional_context}
 === SYSTEM README ===
 {readme}
 

@@ -557,3 +557,142 @@ def render_cfg_slice(analysis: dict | None, focus_function: str,
         marker = "\n...[cfg_abstraction truncated]"
         block = block[:max_chars - len(marker)] + marker
     return block
+
+
+def detect_compositional_candidates(analysis: dict | None) -> list:
+    """Identifies function pairs with shared state flow that could enable
+    compositional attacks (e.g., approve sets allowance, flashLoan reads it).
+
+    Returns a list of dicts:
+        {
+            "writer": function_name,
+            "reader": function_name,
+            "shared_state": [variable_names],
+            "risk": "high" | "medium" | "low"
+        }
+
+    High risk: writer sets an approval/allowance/balance that reader uses in
+    external calls or token transfers.
+    Medium risk: writer modifies state that reader depends on for access control
+    or critical logic.
+    Low risk: any other shared state.
+
+    Returns empty list if analysis is None or no candidates found.
+    """
+    if not analysis:
+        return []
+
+    functions = analysis.get("functions", {})
+    if not functions:
+        return []
+
+    # Build write sets and read sets per function
+    writers = {}  # state_var -> [function_names]
+    readers = {}  # state_var -> [function_names]
+
+    for fname, facts in functions.items():
+        for var in facts.get("state_writes", []):
+            writers.setdefault(var, []).append(fname)
+        for var in facts.get("state_reads", []):
+            readers.setdefault(var, []).append(fname)
+
+    # Find function pairs where one writes and another reads the same state
+    candidates = []
+    seen_pairs = set()
+
+    for state_var, writer_fns in writers.items():
+        reader_fns = readers.get(state_var, [])
+        for writer in writer_fns:
+            for reader in reader_fns:
+                if writer == reader:
+                    continue  # same function, not compositional
+                pair_key = tuple(sorted([writer, reader]))
+                if pair_key in seen_pairs:
+                    continue
+
+                # Determine risk level based on state variable name patterns
+                risk = "low"
+                var_lower = state_var.lower()
+                if any(kw in var_lower for kw in ["allowance", "approval", "approved", "balance", "balances"]):
+                    # Check if reader does external calls or transfers
+                    reader_facts = functions.get(reader, {})
+                    if any(kw in str(reader_facts.get("external_calls", []))
+                           for kw in ["transfer", "call", "send", "delegatecall"]):
+                        risk = "high"
+                    else:
+                        risk = "medium"
+                elif any(kw in var_lower for kw in ["owner", "admin", "role", "permission", "authorized"]):
+                    risk = "medium"
+
+                candidates.append({
+                    "writer": _base_name(writer),
+                    "reader": _base_name(reader),
+                    "shared_state": [state_var],
+                    "risk": risk,
+                })
+                seen_pairs.add(pair_key)
+
+    # Sort by risk (high first) and return top candidates
+    risk_order = {"high": 0, "medium": 1, "low": 2}
+    candidates.sort(key=lambda c: (risk_order.get(c["risk"], 3), c["writer"], c["reader"]))
+
+    return candidates[:10]  # limit to top 10 to avoid prompt bloat
+
+
+def render_compositional_context(analysis: dict | None, focus_function: str) -> str:
+    """Renders a <compositional_context> XML block for the bug hunter when
+    the focus function participates in a compositional candidate pair.
+
+    Example output:
+        <compositional_context>
+          WARNING: This function may be part of a cross-function attack pattern.
+          <candidate risk="high">
+            <writer>approve</writer>
+            <reader>flashLoan</reader>
+            <shared_state>allowance</shared_state>
+            <risk_reason>Writer sets allowance that reader uses in external transfer</risk_reason>
+          </candidate>
+          Consider how state changes in the writer could be exploited by the reader,
+          or how the reader's logic depends on state set by the writer.
+        </compositional_context>
+    """
+    if not analysis:
+        return ""
+
+    candidates = detect_compositional_candidates(analysis)
+    if not candidates:
+        return ""
+
+    # Filter to candidates involving the focus function
+    focus_base = _base_name(focus_function)
+    relevant = [
+        c for c in candidates
+        if c["writer"] == focus_base or c["reader"] == focus_base
+    ]
+
+    if not relevant:
+        return ""
+
+    lines = ["<compositional_context>"]
+    lines.append("  WARNING: This function may be part of a cross-function attack pattern.")
+
+    for c in relevant:
+        lines.append(f'  <candidate risk="{c["risk"]}">')
+        lines.append(f"    <writer>{c['writer']}</writer>")
+        lines.append(f"    <reader>{c['reader']}</reader>")
+        lines.append(f"    <shared_state>{', '.join(c['shared_state'])}</shared_state>")
+        # Add a brief risk explanation
+        if c["risk"] == "high":
+            lines.append(f"    <risk_reason>Writer sets {', '.join(c['shared_state'])} that reader uses in external calls or transfers</risk_reason>")
+        elif c["risk"] == "medium":
+            lines.append(f"    <risk_reason>Writer modifies {', '.join(c['shared_state'])} that reader depends on for critical logic</risk_reason>")
+        else:
+            lines.append(f"    <risk_reason>Shared state: {', '.join(c['shared_state'])}</risk_reason>")
+        lines.append("  </candidate>")
+
+    lines.append("  Consider how state changes in the writer could be exploited by the reader,")
+    lines.append("  or how the reader's logic depends on state set by the writer.")
+    lines.append("  Analyze BOTH functions together to detect compositional vulnerabilities.")
+    lines.append("</compositional_context>")
+
+    return "\n".join(lines)
