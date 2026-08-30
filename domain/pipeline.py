@@ -793,6 +793,106 @@ def _discovery_finding(stem: str, broken: dict) -> dict:
     return built
 
 
+def _run_compositor_phase(stem: str, results: list, raw_contract: str,
+                          readme: str, inspector_obj) -> list:
+    """Runs the Compositor once per contract after all per-function Isolator
+    passes complete. Feeds it the deduplicated Isolator findings + full contract
+    code so it can discover multi-hop, cross-function exploit chains that no
+    single-function analysis would surface.
+
+    Returns a list of compositional findings (may be empty). Non-fatal —
+    a Compositor failure must never sink per-function verdicts."""
+    all_findings = []
+    for r in results:
+        finding = r.get("finding") if isinstance(r.get("finding"), dict) else r
+        if finding.get("intent") and finding.get("target_function"):
+            all_findings.append(finding)
+    if not all_findings:
+        return []
+
+    seen_intents = set()
+    deduped = []
+    for f in all_findings:
+        intent_key = f.get("intent", "").lower().strip()[:100]
+        if intent_key not in seen_intents:
+            seen_intents.add(intent_key)
+            deduped.append(f)
+
+    slim = [
+        {
+            "id": f.get("id", i + 1),
+            "intent": f.get("intent", ""),
+            "target_function": f.get("target_function", ""),
+            "class": f.get("class", "isolated"),
+        }
+        for i, f in enumerate(deduped)
+    ]
+
+    print(f"\n=== COMPOSITOR PHASE: {stem} (cross-function chain analysis) ===")
+    print(f"  [COMPOSITOR] Input: {len(slim)} deduplicated Isolator finding(s)")
+
+    compositor_input = f"""{readme}
+
+{raw_contract}
+
+<isolated_findings>
+{json.dumps(slim, indent=2)}
+</isolated_findings>"""
+
+    try:
+        raw_response = inspector_obj._invoke(
+            inspector_obj.compositor_agent,
+            inspector_obj.compositor_prompt,
+            compositor_input,
+        )
+    except Exception as e:
+        logger.warning("[COMPOSITOR] LLM call failed for %s (non-fatal): %s", stem, e)
+        return []
+
+    try:
+        compositor_data = inspector_obj.extract_json(raw_response)
+    except Exception as e:
+        logger.warning("[COMPOSITOR] JSON parse failed for %s (non-fatal): %s", stem, e)
+        return []
+
+    comp_findings = compositor_data.get("findings", [])
+    if not comp_findings:
+        print(f"  [COMPOSITOR] No cross-function chains discovered")
+        return []
+
+    print(f"  [COMPOSITOR] {len(comp_findings)} compositional finding(s)")
+
+    built_findings = []
+    for idx, cf in enumerate(comp_findings, 1):
+        cf.setdefault("class", "compositional")
+        cf.setdefault("severity_guess", "medium")
+        finding = {
+            "target_function": cf.get("target_function", "contract-level"),
+            "severity_guess": cf.get("severity_guess", "medium"),
+            "intent": cf.get("intent", ""),
+            "constraint": cf.get("constraint", ""),
+            "relevant_code": cf.get("relevant_code", ""),
+            "tool_hint": cf.get("tool_hint", "z3"),
+            "class": "compositional",
+            "related_to": cf.get("related_to", []),
+        }
+        state = {
+            "contract_name": stem,
+            "z3_code": "",
+            "z3_result": None,
+            "iterations": 0,
+        }
+        built = build_finding(finding, state, "", "", "", "compositional")
+        built["metadata"]["source"] = "compositor"
+        built_findings.append(built)
+
+        sev = cf.get("severity_guess", "?").upper()
+        target = cf.get("target_function", "?")
+        print(f"  [COMPOSITOR] [{sev}] {target}: {cf.get('intent', '')[:80]}")
+
+    return built_findings
+
+
 def _run_discovery_phase(stem: str, static_analysis: dict) -> list:
     """Phase C (compositional): one fast LLM call proposes contract-wide
     invariants from STATIC FACTS only; Z3 proves/refutes each across ALL
@@ -1017,6 +1117,27 @@ def run_pipeline(contract_folder: str = None) -> list:
                 results.append(_timeout_finding(stem, func_name))
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
+
+        # Compositor phase: cross-function chain analysis. Runs ONCE per
+        # contract after all per-function Isolator passes complete. Feeds
+        # deduplicated Isolator findings + full contract to the Compositor
+        # which thinks like a malicious MEV searcher to find multi-hop exploit
+        # chains. Non-fatal — a Compositor failure never sinks per-function
+        # verdicts. One LLM call per contract.
+        if not config.is_dry_run() and results:
+            try:
+                comp_results = _run_compositor_phase(
+                    stem, results, raw_solidity_code, readme, inspector
+                )
+                if comp_results:
+                    results.extend(comp_results)
+                    print(f"  [COMPOSITOR] {len(comp_results)} compositional "
+                          f"finding(s) merged into results")
+            except Exception as exc:
+                logger.error("[COMPOSITOR] phase failed for %s (non-fatal): %s",
+                             stem, exc)
+                print(f"  [COMPOSITOR] {stem}: phase failed — non-fatal "
+                      f"({type(exc).__name__}: {str(exc)[:200]})")
 
         # Phase C (compositional): contract-wide invariant discovery. Runs
         # AFTER the per-function graphs so its findings merge into the same
