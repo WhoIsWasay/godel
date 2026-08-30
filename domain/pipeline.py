@@ -840,9 +840,9 @@ def run_pipeline(contract_folder: str = None) -> list:
                     # report, or the function silently drops from the audit.
                     results.append(_error_finding(stem, func_name, exc))
         except concurrent.futures.TimeoutError:
-            # Salvage: futures that finished between the last as_completed yield
-            # and the timeout still hold valid results — collect them instead of
-            # silently discarding (audit fix).
+            # Salvage pass 1: futures that finished between the last
+            # as_completed yield and the timeout still hold valid results —
+            # collect them instead of silently discarding (audit fix).
             for future, func_name in future_to_func.items():
                 if id(future) in processed:
                     continue
@@ -850,14 +850,56 @@ def run_pipeline(contract_folder: str = None) -> list:
                     try:
                         print(f"      [BATCH TIMEOUT SALVAGE] Collecting late-finished result for {func_name}")
                         _collect_future_result(future, func_name, stem, results)
-                        continue
+                        processed.add(id(future))
                     except Exception as exc:
                         logger.error("[GRAPH ERROR] %s raised an exception during salvage: %s", func_name, exc)
                         results.append(_error_finding(stem, func_name, exc))
-                        continue
-                if not future.done():
-                    logger.warning("[GRAPH TIMEOUT] %s exceeded the per-function timeout.", func_name)
-                    results.append(_timeout_finding(stem, func_name))
+                        processed.add(id(future))
+
+            # Salvage pass 2 (grace window): threads still alive past the
+            # deadline are usually one LLM round from saving verified
+            # findings. Declaring them dead immediately split-brained the
+            # report — CI run 33307904841 printed SUMMARY with 2 findings
+            # while the still-running repay graph went on to save its 2nd
+            # confirmed finding to disk. Wait a bounded grace window and
+            # collect whatever finishes inside it.
+            remaining = [f for f in future_to_func
+                         if id(f) not in processed and not f.done()]
+            if remaining:
+                names = ", ".join(future_to_func[f] for f in remaining)
+                print(f"      [BATCH TIMEOUT GRACE] {len(remaining)} graph(s) still "
+                      f"running ({names}) — waiting up to {config.BATCH_TIMEOUT_GRACE:.0f}s "
+                      f"before declaring timeout")
+                try:
+                    for future in concurrent.futures.as_completed(
+                            remaining, timeout=config.BATCH_TIMEOUT_GRACE):
+                        func_name = future_to_func[future]
+                        processed.add(id(future))
+                        try:
+                            print(f"      [BATCH TIMEOUT GRACE] Collecting result for {func_name}")
+                            _collect_future_result(future, func_name, stem, results)
+                        except Exception as exc:
+                            logger.error("[GRAPH ERROR] %s raised an exception during grace salvage: %s", func_name, exc)
+                            results.append(_error_finding(stem, func_name, exc))
+                except concurrent.futures.TimeoutError:
+                    pass
+
+            # Anything still unfinished after the grace window gets a timeout
+            # placeholder now; _drain_late_futures swaps in real results if
+            # the thread finishes before process exit.
+            for future, func_name in future_to_func.items():
+                if id(future) in processed or future.cancelled():
+                    continue
+                if future.done():
+                    processed.add(id(future))
+                    try:
+                        _collect_future_result(future, func_name, stem, results)
+                    except Exception as exc:
+                        logger.error("[GRAPH ERROR] %s raised an exception during salvage: %s", func_name, exc)
+                        results.append(_error_finding(stem, func_name, exc))
+                    continue
+                logger.warning("[GRAPH TIMEOUT] %s exceeded the per-function timeout.", func_name)
+                results.append(_timeout_finding(stem, func_name))
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
@@ -874,8 +916,44 @@ def run_pipeline(contract_folder: str = None) -> list:
                 print(f"  [DISCOVERY] {stem}: phase failed — non-fatal "
                       f"({type(exc).__name__}: {str(exc)[:200]})")
 
+        # Final drain: graphs that outlived even the grace window. Python
+        # joins ThreadPoolExecutor threads at interpreter shutdown anyway, so
+        # the process cannot exit until they finish — waiting here explicitly
+        # costs no extra wall-clock and converts their zombie work into
+        # collected results (SUMMARY stays in sync with what lands on disk).
+        _drain_late_futures(future_to_func, processed, stem, results)
+
     print("\n" + "=" * 50 + "\n=== SYSTEM PIPELINE EXECUTION COMPLETE ===\n" + "=" * 50)
     return results
+
+
+def _drain_late_futures(future_to_func: dict, processed: set, stem: str, results: list):
+    """Collects graphs that outlived the batch timeout + grace window. Their
+    threads keep the process alive regardless (Python joins executor threads
+    at shutdown), so draining explicitly just turns that unavoidable wait
+    into collected results. A real late result supersedes the timeout
+    placeholder appended when the deadline fired — without this, SUMMARY
+    undercounts the findings the same run saves to disk."""
+    late = [f for f in future_to_func
+            if id(f) not in processed and not f.cancelled()]
+    if not late:
+        return
+    names = ", ".join(future_to_func[f] for f in late)
+    print(f"      [LATE DRAIN] {len(late)} graph(s) outlived the grace window "
+          f"({names}) — collecting before exit")
+    for future in concurrent.futures.as_completed(late):
+        func_name = future_to_func[future]
+        processed.add(id(future))
+        try:
+            _collect_future_result(future, func_name, stem, results)
+        except Exception as exc:
+            logger.error("[GRAPH ERROR] %s raised an exception during late drain: %s", func_name, exc)
+            results.append(_error_finding(stem, func_name, exc))
+            continue
+        results[:] = [r for r in results
+                      if not (r.get("contract") == stem
+                              and r.get("function") == func_name
+                              and r.get("qc_status") == "timeout")]
 
 
 def _collect_future_result(future, func_name: str, stem: str, results: list):

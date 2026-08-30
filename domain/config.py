@@ -90,6 +90,11 @@ FUNCTION_MAX_RETRIES       = _env_int("GODEL_FUNCTION_MAX_RETRIES", 2)
 # TIMEOUTS
 # ==========================================
 PER_FUNCTION_TIMEOUT = _env_float("GODEL_PER_FUNCTION_TIMEOUT", 1200.0)
+# Grace window granted to graphs still running when the batch timeout fires.
+# Threads that outlive the deadline are usually one LLM round from saving a
+# verified finding; counting them dead immediately split-brained the report
+# (SUMMARY said 2 findings while 3 landed on disk — CI run 33307904841).
+BATCH_TIMEOUT_GRACE  = _env_float("GODEL_BATCH_TIMEOUT_GRACE", 300.0)
 MAX_WORKERS          = _env_int("GODEL_MAX_WORKERS", 8)
 # Cap on simultaneous LLM invokes across all parallel graph threads. A burst
 # of 8 concurrent hunter calls once triggered a provider episode of instant
