@@ -793,8 +793,96 @@ def _discovery_finding(stem: str, broken: dict) -> dict:
     return built
 
 
+def _verify_compositor_finding(finding: dict, raw_contract: str, stem: str,
+                                readme: str, static_analysis, app,
+                                chain_harness=None) -> dict | None:
+    """Routes one Compositor finding through specifier→executor→gatekeeper→fixer.
+    Returns the verified finding dict if Z3+Foundry confirms it, None otherwise.
+    Non-fatal: a verification failure returns None silently."""
+    target = finding.get("target_function", "")
+    first_func = target.split("->")[0].split("→")[0].strip().split("(")[0].strip()
+
+    if not first_func:
+        return None
+
+    initial_state = {
+        "user_contract": raw_contract,
+        "contract_name": stem,
+        "readme_specs": readme,
+        "messages": [],
+        "next_agent": "specifier",
+        "current_focus_function": first_func,
+        "supervisor_critique": None,
+        "mode": "",
+        "intent": finding.get("intent", ""),
+        "queries": [],
+        "findings": [finding],
+        "verified_bugs": [],
+        "z3_code": "",
+        "z3_result": None,
+        "slither_result": static_analysis,
+        "semantic_harness": chain_harness,
+        "model_quality": chain_harness["quality"] if chain_harness else None,
+        "bug_report": None,
+        "iterations": 0,
+        "supervisor_runs": 0,
+        "executor_runs": 0,
+        "hunter_retries": 0,
+        "poc_test_code": "",
+        "forge_output": "",
+        "qc_status": "",
+        "isolated_xml_packet": "",
+        "wrap_probe_signals": None,
+        "compositional_paired_cfg": None,
+        "compositional_harness": chain_harness,
+        "compositional_model_quality": chain_harness["quality"] if chain_harness else None,
+    }
+
+    try:
+        from domain.graph_nodes import (
+            node_specifier, node_executor, node_gatekeeper, node_fixer,
+            route_after_specifier, route_after_executor,
+            route_after_gatekeeper, route_after_fixer,
+        )
+        from langgraph.graph import StateGraph, END
+        from domain.state import GraphState
+
+        verify_graph = StateGraph(GraphState)
+        verify_graph.add_node("specifier", node_specifier)
+        verify_graph.add_node("executor", node_executor)
+        verify_graph.add_node("gatekeeper", node_gatekeeper)
+        verify_graph.add_node("fixer", node_fixer)
+
+        verify_graph.add_conditional_edges(
+            "specifier", route_after_specifier,
+            {"executor": "executor", "supervisor": "specifier"})
+        verify_graph.add_conditional_edges(
+            "executor", route_after_executor,
+            {"specifier": "specifier", "gatekeeper": "gatekeeper", END: END})
+        verify_graph.add_conditional_edges(
+            "gatekeeper", route_after_gatekeeper,
+            {"fixer": "fixer", "specifier": "specifier", END: END})
+        verify_graph.add_conditional_edges(
+            "fixer", route_after_fixer,
+            {"specifier": "specifier", END: END})
+
+        verify_graph.set_entry_point("specifier")
+        compiled = verify_graph.compile()
+
+        final_state = compiled.invoke(initial_state)
+
+        if final_state.get("verified_bugs"):
+            return final_state
+        return None
+    except Exception as e:
+        logger.warning("[COMPOSITOR VERIFY] failed for %s (non-fatal): %s",
+                       target, e)
+        return None
+
+
 def _run_compositor_phase(stem: str, results: list, raw_contract: str,
-                          readme: str, inspector_obj) -> list:
+                          readme: str, inspector_obj,
+                          static_analysis=None, app=None) -> list:
     """Runs the Compositor once per contract after all per-function Isolator
     passes complete. Feeds it the deduplicated Isolator findings + full contract
     code so it can discover multi-hop, cross-function exploit chains that no
@@ -866,8 +954,9 @@ def _run_compositor_phase(stem: str, results: list, raw_contract: str,
     for idx, cf in enumerate(comp_findings, 1):
         cf.setdefault("class", "compositional")
         cf.setdefault("severity_guess", "medium")
+        target = cf.get("target_function", "contract-level")
         finding = {
-            "target_function": cf.get("target_function", "contract-level"),
+            "target_function": target,
             "severity_guess": cf.get("severity_guess", "medium"),
             "intent": cf.get("intent", ""),
             "constraint": cf.get("constraint", ""),
@@ -876,19 +965,59 @@ def _run_compositor_phase(stem: str, results: list, raw_contract: str,
             "class": "compositional",
             "related_to": cf.get("related_to", []),
         }
-        state = {
-            "contract_name": stem,
-            "z3_code": "",
-            "z3_result": None,
-            "iterations": 0,
-        }
-        built = build_finding(finding, state, "", "", "", "compositional")
-        built["metadata"]["source"] = "compositor"
-        built_findings.append(built)
 
-        sev = cf.get("severity_guess", "?").upper()
-        target = cf.get("target_function", "?")
-        print(f"  [COMPOSITOR] [{sev}] {target}: {cf.get('intent', '')[:80]}")
+        chain_harness = None
+        if static_analysis and ("->" in target or "→" in target):
+            parts = [p.strip().split("(")[0].strip()
+                     for p in target.replace("→", "->").split("->")]
+            parts = [p for p in parts if p]
+            if len(parts) >= 2:
+                try:
+                    from domain.semantics import HarnessEncoder
+                    encoder = HarnessEncoder(static_analysis)
+                    chain_harness = encoder.encode_function_sequence(parts)
+                    if chain_harness:
+                        print(f"    [COMPOSITOR] chain harness built for "
+                              f"{'->'.join(parts)}")
+                except Exception as e:
+                    logger.warning("[COMPOSITOR] chain harness failed: %s", e)
+
+        if app is not None:
+            print(f"    [COMPOSITOR] Verifying finding {idx}/{len(comp_findings)} "
+                  f"via Z3 + Foundry...")
+            verified_state = _verify_compositor_finding(
+                finding, raw_contract, stem, readme,
+                static_analysis, app, chain_harness
+            )
+            if verified_state and verified_state.get("verified_bugs"):
+                for bug in verified_state["verified_bugs"]:
+                    built = build_finding(
+                        bug["finding"], verified_state,
+                        bug.get("fix_code", ""),
+                        bug.get("poc_test_code", ""),
+                        bug.get("forge_output", ""),
+                        bug.get("qc_status", ""),
+                    )
+                    built["metadata"]["source"] = "compositor"
+                    built["metadata"]["class"] = "compositional"
+                    built_findings.append(built)
+                    sev = bug["finding"].get("severity_guess", "?").upper()
+                    print(f"    [COMPOSITOR] VERIFIED [{sev}] {target}")
+            else:
+                sev = cf.get("severity_guess", "?").upper()
+                print(f"    [COMPOSITOR] NOT VERIFIED [{sev}] {target} "
+                      f"(Z3/Foundry did not confirm)")
+        else:
+            state = {
+                "contract_name": stem, "z3_code": "", "z3_result": None,
+                "iterations": 0,
+            }
+            built = build_finding(finding, state, "", "", "", "compositional")
+            built["metadata"]["source"] = "compositor"
+            built_findings.append(built)
+            sev = cf.get("severity_guess", "?").upper()
+            print(f"  [COMPOSITOR] [{sev}] {target}: "
+                  f"{cf.get('intent', '')[:80]}")
 
     return built_findings
 
@@ -1127,7 +1256,8 @@ def run_pipeline(contract_folder: str = None) -> list:
         if not config.is_dry_run() and results:
             try:
                 comp_results = _run_compositor_phase(
-                    stem, results, raw_solidity_code, readme, inspector
+                    stem, results, raw_solidity_code, readme, inspector,
+                    static_analysis=static_analysis, app=app,
                 )
                 if comp_results:
                     results.extend(comp_results)
