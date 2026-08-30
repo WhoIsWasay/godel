@@ -208,16 +208,27 @@ def extract_functions_from_xml(xml_string: str) -> list:
             if not name or "{" not in body:
                 continue
             functions.append({"name": name, "body": body,
-                              "container": el.get("container") or ""})
+                              "container": el.get("container") or "",
+                              "type": el.get("type") or "function"})
         return functions
-    pattern = r'<function\s+name="([^"]+)"[^>]*>(.*?)</function>'
+    pattern = r'<function\s+name="([^"]+)"[^>]*type="([^"]*)"[^>]*>(.*?)</function>'
     matches = re.findall(pattern, xml_string, re.DOTALL)
-    for name, body in matches:
+    for name, ftype, body in matches:
         if "{" not in body:
             continue
         functions.append({"name": name, "body": _strip_cdata(body),
-                          "container": ""})
+                          "container": "",
+                          "type": ftype or "function"})
     return functions
+
+
+_KNOWN_UTILITY_CONTRACTS = {
+    "reentrancyguard", "safemath", "address", "context", "ownable",
+    "erc20", "safeerc20", "counters", "strings", "math", "signedmath",
+    "erc165", "ierc20", "ierc165", "ierc721", "ierc1155",
+    "pullpayment", "pausable", "accesscontrol", "proxy",
+    "damnvaluabletoken", "dvtsender",
+}
 
 
 def scope_functions_to_primary_contract(functions: list, stem: str) -> tuple:
@@ -230,9 +241,15 @@ def scope_functions_to_primary_contract(functions: list, stem: str) -> tuple:
     primary contract. Falls back to the full list whenever scoping is
     ambiguous or would leave zero functions — never silently shrinks
     coverage. Returns (kept, excluded_names)."""
-    containers = {f.get("container") for f in functions if f.get("container")}
+    # Filter out constructors, modifiers, and special functions — they
+    # are not individually auditable entry points.
+    auditable = [f for f in functions if f.get("type", "function") == "function"]
+    if not auditable:
+        auditable = functions
+
+    containers = {f.get("container") for f in auditable if f.get("container")}
     if not containers:
-        return functions, []
+        return auditable, []
     contract_containers = sorted(c for c in containers if c.startswith("contract "))
     target = None
     stem_l = str(stem or "").lower()
@@ -243,11 +260,26 @@ def scope_functions_to_primary_contract(functions: list, stem: str) -> tuple:
     if target is None and len(contract_containers) == 1:
         target = contract_containers[0]
     if target is None:
-        return functions, []
-    kept = [f for f in functions if f.get("container") == target]
+        # Stem didn't match — filter out known utility/base contracts,
+        # then pick the largest remaining contract by function count.
+        candidates = [
+            c for c in contract_containers
+            if c.split(" ", 1)[1].lower() not in _KNOWN_UTILITY_CONTRACTS
+        ]
+        if not candidates:
+            candidates = contract_containers
+        if candidates:
+            def _fn_count(c):
+                return sum(1 for f in auditable if f.get("container") == c)
+            target = max(candidates, key=_fn_count)
+    if target is None:
+        return auditable, []
+    kept = [f for f in auditable if f.get("container") == target]
     if not kept:
-        return functions, []
-    excluded = [f["name"] for f in functions if f.get("container") != target]
+        return auditable, []
+    all_names = {f["name"] for f in functions}
+    kept_names = {f["name"] for f in kept}
+    excluded = sorted(all_names - kept_names)
     return kept, excluded
 
 
@@ -445,13 +477,15 @@ def route_after_hunter(state: GraphState) -> str:
         # Unparseable Isolator output must never masquerade as 'safe', and it
         # should not dead-end either — retry bounded by hunter_retries.
         if state.get("hunter_retries", 0) < config.HUNTER_MAX_PARSE_RETRIES:
-            print(f"      [ROUTING] Hunter output unparseable — retrying "
-                  f"({state.get('hunter_retries', 0) + 1}/{config.HUNTER_MAX_PARSE_RETRIES})")
+            logger.warning("[ROUTING] Hunter output unparseable — retrying "
+                           "(%d/%d)",
+                           state.get('hunter_retries', 0) + 1,
+                           config.HUNTER_MAX_PARSE_RETRIES)
             return "bug_hunter"
-        print("      [ROUTING] Hunter retries exhausted — aborting as analysis_failed.")
+        logger.error("[ROUTING] Hunter retries exhausted — aborting as analysis_failed.")
         return END
     if not state.get("findings"):
-        print(f"      [BUG HUNTER] No vulnerabilities detected in {state.get('current_focus_function')}. Exiting early.")
+        logger.info("[BUG HUNTER] No vulnerabilities detected in %s. Exiting early.", state.get('current_focus_function'))
         return END
     return "supervisor"
 

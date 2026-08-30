@@ -92,11 +92,21 @@ def _parse_hunter_output(raw_response: str, inspector: Inspector):
     parse_error = None
     clean_response = re.sub(r'<think>.*?</think>', '', raw_response, flags=re.DOTALL).strip()
 
+    # Early guard: the LLM sometimes returns only <think>...</think> tags
+    # (reasoning trace with no JSON payload) or malformed markdown fences.
+    # Catch the empty result here with a clear diagnostic instead of letting
+    # json.loads('') cascade through three fallback layers as "char 0".
+    if not clean_response:
+        return [], "LLM response was empty after <think>-strip (reasoning-only output, no JSON payload)"
+
     try:
         if "```json" in clean_response:
             clean_response = clean_response.split("```json")[1].split("```")[0].strip()
         elif "```" in clean_response:
             clean_response = clean_response.split("```")[1].split("```")[0].strip()
+
+        if not clean_response:
+            return [], "LLM response contained only markdown fences with no JSON payload"
 
         # strict=False fixes the "Invalid control character" error natively
         parsed_data = json.loads(clean_response, strict=False)
@@ -107,7 +117,7 @@ def _parse_hunter_output(raw_response: str, inspector: Inspector):
             findings = parsed_data
 
     except json.JSONDecodeError as e:
-        print(f"      [BUG HUNTER WARNING] JSON Parse Error: {e}. Falling back to Inspector extractor...")
+        logger.warning("[BUG HUNTER] JSON Parse Error: %s. Falling back to Inspector extractor.", e)
         try:
             parsed_data = inspector.extract_json(raw_response)
             findings = parsed_data.get("findings", [])
@@ -231,18 +241,18 @@ A <cfg_abstraction> block may be present inside the isolation packet. It is DETE
     # (findings recovered despite a failed pass) is accepted.
     parse_error = "; ".join(parse_errors) if (parse_errors and not findings) else None
     if parse_error:
-        print(f"      [BUG HUNTER ERROR] All {passes} pass(es) failed to produce findings — flagged as analysis failure, NOT as 'safe'.")
-            
+        logger.error("[BUG HUNTER] All %d pass(es) failed to produce findings — flagged as analysis failure, NOT as 'safe'.", passes)
+
     if not isinstance(findings, list):
         findings = []
         parse_error = "Isolator output 'findings' was not a list."
 
     if not findings and not parse_error:
-        print(f"      [BUG HUNTER] No vulnerabilities detected in {state.get('current_focus_function')}. Exiting early.")
+        logger.info("[BUG HUNTER] No vulnerabilities detected in %s. Exiting early.", state.get('current_focus_function'))
     elif parse_error:
         # Never let malformed LLM output masquerade as a clean safety verdict.
         logger.error("[BUG HUNTER PARSE FAILURE] %s", parse_error)
-        print(f"      [BUG HUNTER ERROR] Could not parse Isolator output — flagged as analysis failure, NOT as 'safe'.")
+        logger.error("[BUG HUNTER] Could not parse Isolator output — flagged as analysis failure, NOT as 'safe'.")
 
     return {
         "findings": findings,
@@ -460,6 +470,7 @@ def _gatekeeper_verify(state, gatekeeper, finding, remaining_findings,
             "poc_test_code": test_suite,
             "forge_output": forge_output,
             "qc_status": qc_status,
+            "materialized_filename": real_filename,
         }
         current_bugs = state.get("verified_bugs", [])
         return {
@@ -482,6 +493,7 @@ def _gatekeeper_verify(state, gatekeeper, finding, remaining_findings,
             "poc_test_code": test_suite,
             "forge_output": forge_output,
             "qc_status": qc_status,
+            "materialized_filename": real_filename,
         }
         current_bugs = state.get("verified_bugs", [])
         return {
@@ -546,6 +558,27 @@ def fixer_node(state: GraphState, fixer: FixerAgent, formatter: SubmissionFormat
             file_path = os.path.join(folder_path, filename)
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(content)
+
+        # Re-materialize the contract source so PoC.t.sol's
+        # `import "src/<filename>.sol"` resolves. The gatekeeper's temporary
+        # copy was cleaned up in its finally block; this is the durable copy.
+        materialized_filename = latest_bug.get("materialized_filename")
+        if materialized_filename:
+            src_dir = os.path.join(folder_path, "src")
+            os.makedirs(src_dir, exist_ok=True)
+            src_path = os.path.join(src_dir, materialized_filename)
+            with open(src_path, "w", encoding="utf-8") as f:
+                f.write(state.get("user_contract", ""))
+            # Minimal foundry.toml so `forge test` works after a one-time
+            # `forge install foundry-rs/forge-std` inside the artifact folder.
+            toml_path = os.path.join(folder_path, "foundry.toml")
+            if not os.path.exists(toml_path):
+                with open(toml_path, "w", encoding="utf-8") as f:
+                    f.write("[profile.default]\n"
+                            'src = "src"\n'
+                            'out = "out"\n'
+                            'libs = ["lib"]\n'
+                            'solc_version = "0.8.19"\n')
 
         print(f"Successfully created folder '{folder_path}' and wrote {len(files_to_write)} files.")
             
