@@ -2,6 +2,7 @@ import httpx
 import psycopg2
 import psycopg2.extras
 import os
+import sys
 import time
 import logging
 from pathlib import Path
@@ -12,11 +13,28 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 logger = logging.getLogger(__name__)
 
-# Prefixed print so RAG diagnostics are impossible to miss in terminal logs.
+# RAG logs go through the standard logger only — no print(). The two-tier
+# filter in domain/config.py then suppresses them from the console on INFO
+# runs (console floor is WARNING+) while the file handler at OUTPUT_DIR
+# keeps every line for ParadeDB / forensic replay. Set GODEL_CONSOLE_DEBUG=1
+# to restore full RAG noise on the terminal when diagnosing retrieval.
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("SENTENCE_TRANSFORMERS_VERBOSITY", "error")
+
+# HuggingFace's own loggers are registered independently of the Python root;
+# pin them to ERROR so their "unauthenticated requests" warning never reaches
+# any handler regardless of how the caller configures logging.
+for _name in ("huggingface_hub", "huggingface_hub.utils._http",
+              "transformers", "sentence_transformers"):
+    logging.getLogger(_name).setLevel(logging.ERROR)
+
+
 def _raglog(msg: str):
-    line = f"[RAG] {msg}"
-    print(line, flush=True)
-    logger.info(line)
+    # INFO by default; the caller can pass level=logging.DEBUG to keep a
+    # noisy per-call line (e.g. embed() timings) off the file log as well.
+    logger.info(f"[RAG] {msg}")
 
 
 OLLAMA_URL  = "http://localhost:11434/api/embed"
@@ -50,11 +68,17 @@ def _get_cross_encoder():
         with _cross_encoder_lock:
             if _cross_encoder is None:  # double-checked under lock
                 t0 = time.time()
-                _raglog("Loading cross-encoder reranker (ms-marco-MiniLM-L-6-v2)...")
-                from sentence_transformers import CrossEncoder
-                _cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+                logger.info("[RAG] Loading cross-encoder reranker (ms-marco-MiniLM-L-6-v2)...")
+                # tqdm + torch hub chatter write to stderr directly; silence them
+                # around the import + constructor so the console stays clean
+                # even when the two-tier filter floor is low.
+                import contextlib
+                with open(os.devnull, "w", encoding="utf-8") as _null, \
+                     contextlib.redirect_stderr(_null):
+                    from sentence_transformers import CrossEncoder
+                    _cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
                 _cross_encoder_loaded_at = time.time() - t0
-                _raglog(f"Cross-encoder loaded in {_cross_encoder_loaded_at:.1f}s")
+                logger.info(f"[RAG] Cross-encoder loaded in {_cross_encoder_loaded_at:.1f}s")
     return _cross_encoder
 
 
