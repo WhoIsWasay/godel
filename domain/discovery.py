@@ -28,7 +28,7 @@ import re
 from domain.invariants import (check_invariant_preservation,
                                _referenced_keys, InvariantSyntaxError)
 from domain.semantics import generate_harness
-from domain.llm_utils import call_with_retry
+from domain.llm_utils import call_with_retry, guarded_invoke
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +135,7 @@ def propose_invariants(analysis: dict, llm, max_invariants: int = 6) -> tuple[li
     prompt = _system_prompt(keys[:40], max_invariants)
     user = fact_sheet(analysis)
     try:
-        resp = call_with_retry(lambda: llm.invoke([
+        resp = call_with_retry(lambda: guarded_invoke(llm, [
             ("system", prompt), ("user", user)]))
         content = resp.content if hasattr(resp, "content") else str(resp)
     except Exception as e:

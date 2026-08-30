@@ -933,27 +933,40 @@ def _drain_late_futures(future_to_func: dict, processed: set, stem: str, results
     at shutdown), so draining explicitly just turns that unavoidable wait
     into collected results. A real late result supersedes the timeout
     placeholder appended when the deadline fired — without this, SUMMARY
-    undercounts the findings the same run saves to disk."""
+    undercounts the findings the same run saves to disk.
+
+    The drain is capped at PER_FUNCTION_TIMEOUT: every inner operation (LLM
+    call, Z3/forge subprocess, embed) already has its own timeout, so a
+    healthy straggler finishes well inside the cap; a genuinely wedged
+    thread must not hang the pipeline forever."""
     late = [f for f in future_to_func
             if id(f) not in processed and not f.cancelled()]
     if not late:
         return
     names = ", ".join(future_to_func[f] for f in late)
+    cap = config.PER_FUNCTION_TIMEOUT
     print(f"      [LATE DRAIN] {len(late)} graph(s) outlived the grace window "
-          f"({names}) — collecting before exit")
-    for future in concurrent.futures.as_completed(late):
-        func_name = future_to_func[future]
-        processed.add(id(future))
-        try:
-            _collect_future_result(future, func_name, stem, results)
-        except Exception as exc:
-            logger.error("[GRAPH ERROR] %s raised an exception during late drain: %s", func_name, exc)
-            results.append(_error_finding(stem, func_name, exc))
-            continue
-        results[:] = [r for r in results
-                      if not (r.get("contract") == stem
-                              and r.get("function") == func_name
-                              and r.get("qc_status") == "timeout")]
+          f"({names}) — collecting before exit (cap {cap:.0f}s)")
+    try:
+        for future in concurrent.futures.as_completed(late, timeout=cap):
+            func_name = future_to_func[future]
+            processed.add(id(future))
+            try:
+                _collect_future_result(future, func_name, stem, results)
+            except Exception as exc:
+                logger.error("[GRAPH ERROR] %s raised an exception during late drain: %s", func_name, exc)
+                results.append(_error_finding(stem, func_name, exc))
+                continue
+            results[:] = [r for r in results
+                          if not (r.get("contract") == stem
+                                  and r.get("function") == func_name
+                                  and r.get("qc_status") == "timeout")]
+    except concurrent.futures.TimeoutError:
+        stuck = [future_to_func[f] for f in late if id(f) not in processed]
+        logger.error("[LATE DRAIN] cap exceeded — abandoning: %s "
+                     "(their timeout placeholders stand)", ", ".join(stuck))
+        print(f"      [LATE DRAIN] WARNING: {', '.join(stuck)} did not finish "
+              f"within the drain cap — timeout placeholders kept")
 
 
 def _collect_future_result(future, func_name: str, stem: str, results: list):

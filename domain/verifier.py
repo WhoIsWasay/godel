@@ -2,7 +2,7 @@ import os
 from langchain_core.messages import SystemMessage, HumanMessage
 from domain.config import PROMPTS_DIR
 from domain.extractor import OutputExtractor
-from domain.llm_utils import call_with_retry
+from domain.llm_utils import call_with_retry, guarded_invoke
 from domain.solc_compat import needs_legacy_harness, legacy_generation_directive, LEGACY_HEAL_HINT
 
 
@@ -123,7 +123,7 @@ Extracted Tool Logs: {facts}
 Read the contract source inside <contract> tags, parse its true interface bounds per the system-prompt laws, and generate the complete standalone Foundry property test code (.t.sol) that imports "src/{contract_filename}"."""
 
         response = call_with_retry(
-            lambda: self.llm.invoke([
+            lambda: guarded_invoke(self.llm, [
                 SystemMessage(content=self.system_prompt),
                 HumanMessage(content=user_content),
             ])
@@ -144,7 +144,7 @@ COMPILER ERROR:
 {error_log}
 {legacy_reminder}
 Review the original target contract interface, correct the syntax/arguments according to the exact error, and return ONLY the corrected raw Solidity code inside markdown fences."""
-        response = call_with_retry(lambda: self.heal_llm.invoke(feedback_prompt))
+        response = call_with_retry(lambda: guarded_invoke(self.heal_llm, feedback_prompt))
         return self._clean_markdown(response.content.strip())
 
     def _clean_markdown(self, content: str) -> str:

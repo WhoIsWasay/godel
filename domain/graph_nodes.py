@@ -14,7 +14,7 @@ from domain.gatekeeper import FoundryGatekeeper
 from domain.fixer import FixerAgent
 from domain.formatter import SubmissionFormatter
 from domain.schema import build_finding
-from domain.llm_utils import EmptyResponseError, call_with_retry
+from domain.llm_utils import EmptyResponseError, call_with_retry, guarded_invoke
 from domain.semantics import compose_reachability_script
 from domain.z3_runner import run_z3
 import uuid
@@ -46,7 +46,7 @@ def supervisor_node(state: GraphState, llm_pro):
         HumanMessage(content=f"Review the following proposed findings against the contract code:\n{state_summary}")
     ]
 
-    response = call_with_retry(lambda: llm_pro.invoke(messages))
+    response = call_with_retry(lambda: guarded_invoke(llm_pro, messages))
     raw_content = response.content.strip()
     
     # Clean out any leaked <think> blocks

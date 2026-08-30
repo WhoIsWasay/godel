@@ -20,7 +20,7 @@ import re
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from domain import config
-from domain.llm_utils import call_with_retry
+from domain.llm_utils import call_with_retry, guarded_invoke
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +74,7 @@ class CEGIS:
 
 Return ONLY the corrected full Python code block."""
         try:
-            response = call_with_retry(lambda: self.agent.invoke([
+            response = call_with_retry(lambda: guarded_invoke(self.agent, [
                 SystemMessage(content=self.SYSTEM_PROMPT),
                 HumanMessage(content=user),
             ]))

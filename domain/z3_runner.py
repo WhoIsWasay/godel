@@ -131,6 +131,22 @@ def validate_script(z3_code: str):
     return None
 
 
+def _unlink_quietly(path: str) -> None:
+    """Best-effort temp-file removal. On Windows the just-killed z3 child can
+    still hold the file for a moment after a timeout; an unguarded os.unlink
+    in `finally` would replace the carefully built timeout/error result with
+    a raw PermissionError. Retry once briefly, then give up — a stray temp
+    script is harmless, a lost verdict is not."""
+    import time as _time
+    for attempt in range(3):
+        try:
+            os.unlink(path)
+            return
+        except OSError:
+            if attempt < 2:
+                _time.sleep(0.2)
+
+
 def run_z3(z3_code: str, strict: bool = False) -> dict:
     violation = validate_script(z3_code)
     if violation:
@@ -172,4 +188,4 @@ def run_z3(z3_code: str, strict: bool = False) -> dict:
     except Exception as e:
         return {"status": "error", "output": None, "error": str(e), "z3_code": z3_code}
     finally:
-        os.unlink(temp_path)
+        _unlink_quietly(temp_path)

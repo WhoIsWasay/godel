@@ -4,7 +4,7 @@ import logging
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_openai import ChatOpenAI
 
-from domain.llm_utils import call_with_retry
+from domain.llm_utils import call_with_retry, guarded_invoke
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +66,7 @@ Output the corrected `{target_function_name}` function body only, inside ```soli
 
         try:
             response = call_with_retry(
-                lambda: self.agent.invoke([
+                lambda: guarded_invoke(self.agent, [
                     SystemMessage(content=self.system_prompt),
                     HumanMessage(content=user_payload),
                 ])

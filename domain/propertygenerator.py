@@ -2,7 +2,7 @@ import json
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from domain.config import PROMPTS_DIR
-from domain.llm_utils import call_with_retry
+from domain.llm_utils import call_with_retry, guarded_invoke
 
 
 class PropertyGenerator:
@@ -28,7 +28,7 @@ class PropertyGenerator:
     
     def propertyGeneration(self) -> str:
         response = call_with_retry(
-            lambda: self.agent.invoke([
+            lambda: guarded_invoke(self.agent, [
                 SystemMessage(content=self.SYSTEM_PROMPT),
                 HumanMessage(content=self.prompt),
             ])

@@ -1,7 +1,23 @@
 import random
+import threading
 import time
 
 from domain import config
+
+# Process-wide throttle on simultaneous LLM invokes. A burst of concurrent
+# hunter calls once hit a provider episode of instant empty-200 responses;
+# capping concurrency keeps load on the provider bounded. EVERY LLM call
+# site must go through guarded_invoke — a semaphore living in one agent
+# module (the old inspector-only version) silently left the other six call
+# sites unthrottled, so 8 graph threads could burst the provider anyway.
+_LLM_SEMAPHORE = threading.Semaphore(max(1, config.LLM_CONCURRENCY))
+
+
+def guarded_invoke(agent, messages):
+    """The single throttled entry point for all provider calls."""
+    with _LLM_SEMAPHORE:
+        return agent.invoke(messages)
+
 
 # HTTP status codes that retrying can never fix (auth, bad request, billing,
 # context length). Everything else (429, 5xx, timeouts, connection resets)
