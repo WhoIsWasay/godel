@@ -59,13 +59,16 @@ class FakeLLM:
         return FakeResp(_j.dumps(self.payload))
 
 
-# Case matrix: proven / broken / unknown-symbol rejection / duplicate.
+# Case matrix: proven / broken / unknown-symbol rejection / duplicate /
+# junk-monotonicity rejection (03c335b: such proposals are trivially refutable
+# noise — the ping-test run proved they surface as false-positive HIGHs).
 payload = {"invariants": [
-    "total@new >= 0",            # should be PROVEN
-    "total@new >= total",        # conservation: PROVEN (deposit only adds)
-    "bal[S]@new == 0",           # FALSE for deposit -> BROKEN with cex
-    "mystery@new > 0",           # unknown symbol -> rejected
-    "total@new >= 0",            # duplicate -> dropped silently
+    "total@new >= 0",                 # should be PROVEN
+    "total@new >= total",             # junk monotonicity -> REJECTED pre-solver
+    "total@new == bal[S]@new",        # conservation: PROVEN (deposit adds equal amounts)
+    "bal[S]@new == 0",                # FALSE for deposit -> BROKEN with cex
+    "mystery@new > 0",                # unknown symbol -> rejected
+    "total@new >= 0",                 # duplicate -> dropped silently
 ]}
 llm = FakeLLM(payload)
 result = discover_invariants(analysis, llm)
@@ -75,8 +78,10 @@ print(f"   broken={[(b['invariant'], b['violated_by']) for b in result['broken']
 print(f"   rejected={[(r['invariant'], r['reason'][:40]) for r in result['rejected']]}")
 
 proven_set = {p["invariant"] for p in result["proven"]}
-check("conservation invariant PROVEN", "total@new >= total" in proven_set)
+check("conservation invariant PROVEN", "total@new == bal[S]@new" in proven_set)
 check("trivial bound PROVEN", "total@new >= 0" in proven_set)
+check("junk monotonicity REJECTED pre-solver",
+      any(r["invariant"] == "total@new >= total" for r in result["rejected"]))
 check("false invariant BROKEN", len(result["broken"]) == 1
       and result["broken"][0]["invariant"] == "bal[S]@new == 0")
 b0 = result["broken"][0]
