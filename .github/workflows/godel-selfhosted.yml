@@ -47,9 +47,23 @@ jobs:
       - name: Preflight doctor
         run: python main.py --doctor
 
+      - name: Require API key for real runs
+        if: ${{ inputs.dry_run == false }}
+        env:
+          KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "::error::DEEPSEEK_API_KEY secret is not set. Add it under Settings > Secrets and variables > Actions before running a real audit."
+            exit 1
+          fi
+
       - name: Run Gödel pipeline
         env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          # pipeline.py constructs ChatOpenAI clients at import time; when the
+          # secret is absent (dry runs) a placeholder keeps construction happy —
+          # dry-run never makes an LLM call. Real runs require the real secret
+          # (enforced by the step above).
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY || 'ci-placeholder-not-used' }}
           GODEL_CONTRACTS_FOLDER: ${{ inputs.contract_folder }}
           GODEL_DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
         run: python main.py --contracts "$GODEL_CONTRACTS_FOLDER"
