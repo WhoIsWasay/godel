@@ -168,7 +168,7 @@ def bug_hunter_node(state: GraphState, inspector: Inspector):
                 rag_context += "\nAdditional patterns to CHECK:\n"
                 rag_context += "\n".join(lines)
     except Exception as e:
-        print(f"      [RAG WARNING] hunter RAG retrieval failed (non-fatal): {e}")
+        logger.warning("hunter RAG retrieval failed (non-fatal): %s", e)
     
     # Inject full contract reference, but STRICTLY bound the AI to the focus function
     input_text = f"""[CRITICAL INSTRUCTION]
@@ -264,7 +264,7 @@ def specifier_node(state: GraphState, generator: PropertyGenerator):
             finding, final_top_k=5, top_k_per_query=10
         )
     except Exception as e:
-        print(f"      [RAG WARNING] specifier RAG retrieval failed (non-fatal): {e}")
+        logger.warning("specifier RAG retrieval failed (non-fatal): %s", e)
 
     generator.build_prompt(
         {"intent": finding.get("intent", ""), "queries": rag_diag.get("queries", [])},

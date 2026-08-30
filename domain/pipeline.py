@@ -991,9 +991,9 @@ def _collect_future_result(future, func_name: str, stem: str, results: list):
     p3 = rag_ps.get(3, {}).get("p_at_k")
     p1 = rag_ps.get(1, {}).get("p_at_k")
     if p5 is not None:
-        print(f"      [RAG] {focus_func}: P@1={p1} P@3={p3} P@5={p5} "
-              f"n_retrieved={rag_diag.get('n_retrieved')} "
-              f"elapsed={rag_diag.get('elapsed')}s")
+        logger.info("[RAG] %s: P@1=%s P@3=%s P@5=%s n_retrieved=%s elapsed=%ss",
+                    focus_func, p1, p3, p5,
+                    rag_diag.get('n_retrieved'), rag_diag.get('elapsed'))
 
     if config.is_dry_run():
         print(f"  [GRAPH OUTPUT] {focus_func}: dry-run plumbing OK (LLM nodes mocked)")

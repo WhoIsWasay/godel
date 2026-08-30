@@ -38,9 +38,7 @@ TITLE_JACCARD   = 0.25     # min Jaccard between finding intent and retrieved ti
 
 
 def _raglog(msg: str):
-    line = f"[RAG] {msg}"
-    print(line, flush=True)
-    logger.info(line)
+    logger.info("[RAG] %s", msg)
 
 
 def _words(text: str) -> set:
