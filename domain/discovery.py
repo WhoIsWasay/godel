@@ -86,7 +86,11 @@ def _system_prompt(keys: list[str], max_invariants: int) -> str:
     return f"""You are an invariant PROPOSER for a Solidity formal verifier.
 
 TASK: Propose up to {max_invariants} MEANINGFUL contract invariants that SHOULD hold
-for the contract below (e.g. conservation, solvency, bounds, monotonicity).
+for the contract below (e.g. conservation, solvency, bounds, agreement between paired fields).
+
+NEVER propose pure monotonicity ("X@new >= X" or "X@new <= X" for a single field):
+mutable state legitimately moves in both directions (deposits AND withdrawals), so such
+proposals are trivially refutable noise.
 
 STRICT GRAMMAR (violations are auto-rejected):
 - Python/Z3 boolean expressions over EXACTLY these symbols: {keys}
@@ -116,6 +120,13 @@ def _extract_json(raw: str) -> dict:
     return {}
 
 
+_PURE_MONOTONICITY = re.compile(
+    r"^\s*(?P<a>[A-Za-z_][\w.\[\]#]*)\s*@\s*new\s*(?:>=|<=|>|<)\s*(?P=a)\s*$"
+    r"|^\s*(?P<b>[A-Za-z_][\w.\[\]#]*)\s*(?:>=|<=|>|<)\s*(?P=b)\s*@\s*new\s*$",
+    re.IGNORECASE,
+)
+
+
 def propose_invariants(analysis: dict, llm, max_invariants: int = 6) -> tuple[list[str], list[str]]:
     """Returns (valid_proposals, rejected_with_reason)."""
     keys = _union_keys(analysis)
@@ -141,6 +152,13 @@ def propose_invariants(analysis: dict, llm, max_invariants: int = 6) -> tuple[li
         if inv.lower() in seen:
             continue
         seen.add(inv.lower())
+        if _PURE_MONOTONICITY.match(inv):
+            # Junk class observed in the wild (ping-test run): "X@new >= X" over
+            # mutable state is refuted by any legitimate setter/withdrawal, so it
+            # always produces HIGH-severity false positives. Kill it pre-solver.
+            rejected.append((inv, "pure monotonicity over mutable state — not a "
+                                  "protocol invariant (legitimate operations move it both ways)"))
+            continue
         refs = _referenced_keys(inv, keys)
         if not refs:
             rejected.append((inv, "references no known symbols"))

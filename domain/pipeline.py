@@ -659,7 +659,10 @@ def _discovery_finding(stem: str, broken: dict) -> dict:
 
     finding = {
         "target_function": func,
-        "severity_guess": "high",
+        # MEDIUM, not HIGH: the violation is machine-proven, but the invariant
+        # itself is LLM-proposed — a junk proposal slipping past the filter
+        # would otherwise surface as a HIGH false positive.
+        "severity_guess": "medium",
         "intent": (f"Contract invariant broken: '{broken['invariant']}' — violated by "
                    f"{', '.join(violated)} with a machine-found concrete counterexample "
                    f"(Z3 induction step over the deterministic static-analysis model)"),
