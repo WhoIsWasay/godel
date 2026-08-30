@@ -215,3 +215,43 @@ def retrieve(queries: list[str], top_k_per_query: int = 10, final_top_k: int = 5
                 f"[{r.get('severity')}] {str(r.get('title_normalized'))[:70]} class={r.get('vuln_class')}")
     _raglog(f"RETRIEVE total time: {time.time()-t0_total:.1f}s")
     return final
+
+
+# ---------------------------------------------------------------------------
+# Run-log persistence: the noisy full log (output/godel-run-full.log) goes to
+# the DB so the CI console can stay clean. Best-effort and non-fatal: GitHub-
+# hosted runners can't reach the local ParadeDB, self-hosted ones can.
+# ---------------------------------------------------------------------------
+def save_run_log(contracts_folder: str, findings_count: int, status: str,
+                 log_path) -> bool:
+    try:
+        text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        logger.warning("[LOG DB] could not read %s: %s", log_path, e)
+        return False
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS godel_run_logs (
+                        id               BIGSERIAL PRIMARY KEY,
+                        run_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        contracts_folder TEXT,
+                        findings_count   INT,
+                        status           TEXT,
+                        log_text         TEXT
+                    )
+                """)
+                cur.execute(
+                    "INSERT INTO godel_run_logs "
+                    "(contracts_folder, findings_count, status, log_text) "
+                    "VALUES (%s, %s, %s, %s)",
+                    (str(contracts_folder), int(findings_count), status, text))
+            conn.commit()
+        finally:
+            conn.close()
+        return True
+    except Exception as e:
+        logger.warning("[LOG DB] ParadeDB unreachable, run log kept on disk only: %s", e)
+        return False

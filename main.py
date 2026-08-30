@@ -327,7 +327,28 @@ def main():
     for r in results:
         print(f"  [{r.get('severity', 'unknown').upper()}] {r.get('contract')}::{r.get('function')} ({r.get('qc_status', 'unknown')})")
 
+    _persist_run_log(folder, results)
+
     return results
+
+
+def _persist_run_log(folder, results):
+    """Store the noisy full log (console stays clean). Best-effort: GitHub-hosted
+    runners can't reach the local ParadeDB — the file on disk is the fallback."""
+    from domain import config
+    log_path = config.OUTPUT_DIR / "godel-run-full.log"
+    if not log_path.exists():
+        return
+    try:
+        from Infrastructure.postgres import save_run_log
+        ok = save_run_log(folder, len(results), "completed", log_path)
+        if ok:
+            print(f"[LOG DB] Full run log saved to ParadeDB (source: {log_path.name}, "
+                  f"{log_path.stat().st_size // 1024} KB)")
+        else:
+            print(f"[LOG DB] DB unavailable — full run log kept at {log_path}")
+    except Exception as exc:
+        print(f"[LOG DB] skipped ({exc})")
 
 
 if __name__ == "__main__":

@@ -73,7 +73,9 @@ jobs:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY || 'ci-placeholder-not-used' }}
           GODEL_CONTRACTS_FOLDER: ${{ steps.folder.outputs.path }}
           GODEL_DRY_RUN: ${{ steps.folder.outputs.dry || '0' }}
-        run: python main.py --contracts "$GODEL_CONTRACTS_FOLDER"
+        run: |
+          set -o pipefail
+          python main.py --contracts "$GODEL_CONTRACTS_FOLDER" 2>&1 | tee godel-run.log
 
       - name: Render reports
         run: python render.py
@@ -86,6 +88,10 @@ jobs:
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
           echo "Verified findings: $COUNT"
 
+      - name: Write job summary
+        shell: bash
+        run: python ci_summary.py >> "$GITHUB_STEP_SUMMARY" || echo "ci_summary failed (non-fatal)"
+
       - name: Upload findings artifact
         uses: actions/upload-artifact@v4
         with:
@@ -93,6 +99,8 @@ jobs:
           path: |
             output/submissions/
             output/rendered/
+            godel-run.log
+            output/godel-run-full.log
 
       - name: Comment on PR
         if: github.event_name == 'pull_request'

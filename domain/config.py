@@ -138,9 +138,31 @@ def is_dry_run() -> bool:
 
 
 def setup_logging(level: str = None):
+    """Two-tier logging: WARNING+ on the console (clean CI terminal), EVERYTHING
+    to OUTPUT_DIR/godel-run-full.log (the noise tier persisted to the DB)."""
+    root = logging.getLogger()
+    if root.handlers:
+        return
     level = level or os.environ.get("GODEL_LOG_LEVEL", "INFO")
-    logging.basicConfig(
-        level=getattr(logging, str(level).upper(), logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    lvl = getattr(logging, str(level).upper(), logging.INFO)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                            datefmt="%Y-%m-%d %H:%M:%S")
+    root.setLevel(lvl)
+
+    console = logging.StreamHandler()
+    if os.environ.get("GODEL_CONSOLE_DEBUG"):
+        console.setLevel(lvl)
+    else:
+        console.setLevel(max(lvl, logging.WARNING))
+    console.setFormatter(fmt)
+    root.addHandler(console)
+
+    try:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        fileh = logging.FileHandler(OUTPUT_DIR / "godel-run-full.log",
+                                    mode="a", encoding="utf-8")
+        fileh.setLevel(lvl)
+        fileh.setFormatter(fmt)
+        root.addHandler(fileh)
+    except OSError:
+        pass
