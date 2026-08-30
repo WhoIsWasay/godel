@@ -1,10 +1,10 @@
-"""domain/semantics.py â€” Phase 2 deterministic semantic encoder (v1).
+"""domain/semantics.py â€" Phase 2 deterministic semantic encoder (v1).
 
 Generates a Z3 harness (`build_model()`) DIRECTLY from static-analysis facts
 (domain.abstracter). The LLM no longer invents Solidity semantics; it only
 writes the PROPERTY assertion against harness symbols V[...].
 
-Soundness policy (over-approximation â€” anything untranslatable becomes FREE,
+Soundness policy (over-approximation â€" anything untranslatable becomes FREE,
 never assumed):
   - Untranslatable guard       -> guard DROPPED (weaker assumption = more states)
   - External call              -> quality PARTIAL; state effects remain havocked
@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 MODEL_QUALITY_FULL = "FULL"
 MODEL_QUALITY_PARTIAL = "PARTIAL"
+MODEL_QUALITY_CHAIN = "CHAIN"
 
 _IDENT_RE = re.compile(r"[A-Za-z_$][A-Za-z0-9_.]*")
 _INDEX_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\[([^\[\]]+)\]")
@@ -139,23 +140,26 @@ def _translate_condition(sub_text: str, valid_names: set[str]):
 
 
 class HarnessEncoder:
-    def __init__(self, analysis: dict):
+    def __init__(self, analysis: dict, suffix: str = ""):
         self.analysis = analysis
         self.contract = analysis.get("contract", "")
         self.state_vars = {v["name"] for v in analysis.get("storage_layout", [])}
         self.decls: list[str] = []
         self.bounds: list[str] = []
         self.registry: dict[str, str] = {}  # friendly key -> z3 name
+        self.suffix = suffix  # for chain encoding: "_c1", "_c2", etc.
 
     # ------------------------------------------------------------- symbols
     def _reg(self, friendly: str, zname: str, bounded: bool = True) -> str:
-        if friendly not in self.registry:
-            self.registry[friendly] = zname
-            self.decls.append(f"{zname} = Int('{zname}')")
+        suffixed_friendly = f"{friendly}{self.suffix}" if self.suffix else friendly
+        suffixed_zname = f"{zname}{self.suffix}"
+        if suffixed_friendly not in self.registry:
+            self.registry[suffixed_friendly] = suffixed_zname
+            self.decls.append(f"{suffixed_zname} = Int('{suffixed_zname}')")
             if bounded:
-                self.bounds.append(f"{zname} >= 0")
-                self.bounds.append(f"{zname} <= 2**256 - 1")
-        return self.registry[friendly]
+                self.bounds.append(f"{suffixed_zname} >= 0")
+                self.bounds.append(f"{suffixed_zname} <= 2**256 - 1")
+        return self.registry[suffixed_friendly]
 
     def _scalar_pair(self, name: str):
         self._reg(name, f"{_san(name)}__old")
@@ -202,18 +206,61 @@ class HarnessEncoder:
             base, raw_idx = m.group(1), m.group(2).strip()
             ik = "S" if raw_idx == "msg_sender" else _san(raw_idx)[:18] or "x"
             self._slot_pair(base, ik)                      # ensures both registered
-            cur = self.registry[f"{base}[{ik}]"]
-            new_sym = self.registry[f"{base}[{ik}]@new"]
+            s = self.suffix
+            cur = self.registry[f"{base}[{ik}]{s}"]
+            new_sym = self.registry[f"{base}[{ik}]@new{s}"]
             return new_sym, cur, "slot_state"
         if lhs in self.state_vars:
             new_sym = self._scalar_pair(lhs)
-            cur = self.registry[lhs]
+            cur = self.registry[f"{lhs}{self.suffix}"]
             return new_sym, cur, "scalar_state"
         zl = self._reg(f"loc_{lhs}", f"l_{_san(lhs)}", bounded=False)
         return zl, zl, "local"
 
+    # ------------------------------------------------ external call resolution
+    _KNOWN_EXTERNAL = frozenset({
+        "transfer", "transferFrom", "approve", "call", "delegatecall",
+        "staticcall", "send", "create", "create2", "selfdestruct",
+    })
+
+    def _resolve_call_target(self, call_expr: str) -> tuple[str, dict] | None:
+        """Attempts to resolve an external call to a same-contract function.
+        Returns (full_key, facts) or None. Skips known external patterns and
+        targets that themselves have external calls."""
+        m = re.match(r"(?:this\.)?(?:\w+\.)?(\w+)\s*\(", call_expr.strip())
+        if not m:
+            return None
+        target_name = m.group(1)
+        if target_name.lower() in self._KNOWN_EXTERNAL:
+            return None
+        functions = self.analysis.get("functions", {})
+        target_key = next(
+            (k for k in functions if k.split("(", 1)[0] == target_name), None)
+        if target_key is None:
+            return None
+        target_facts = functions[target_key]
+        if target_facts.get("has_external_call"):
+            return None
+        return target_key, target_facts
+
+    def _encode_resolved_target_guards(self, target_facts: dict,
+                                        params: dict) -> list[str]:
+        """Extracts encodable guard constraints from a resolved call target,
+        giving Z3 more information about post-call state preconditions."""
+        codes = []
+        for g in target_facts.get("guards", []):
+            text = g["text"] if isinstance(g, dict) else g
+            sub = self._read_view(text, params)
+            code, _ = _translate(sub, set(self.registry.values()))
+            if code:
+                codes.append(code)
+        return codes
+
     # -------------------------------------------------------------- encode
-    def encode_function(self, focus_function: str) -> dict | None:
+    def _encode_raw(self, focus_function: str) -> dict | None:
+        """Core encoding logic returning intermediate data without code assembly.
+        Returns dict with guard_codes, trans_codes, quality, untranslated,
+        registry, decls, bounds, or None if function not found."""
         functions = self.analysis.get("functions", {})
         key = next((k for k in functions
                     if k.split("(", 1)[0] == focus_function.split("(", 1)[0]), None)
@@ -224,7 +271,6 @@ class HarnessEncoder:
         quality = MODEL_QUALITY_FULL
         untranslated: list[str] = []
 
-        # ---- parameters (attacker-controlled) ----
         params: dict[str, str] = {}
         for p in f.get("params", []):
             if p["type"].startswith("uint") or p["type"] in ("address",):
@@ -234,21 +280,14 @@ class HarnessEncoder:
                 untranslated.append(f"param not modeled: {p['name']}:{p['type']}")
                 quality = MODEL_QUALITY_PARTIAL
 
-        # ---- ambient ----
         self._reg("msg_sender", "msg_sender")
         self._reg("msg_value", "msg_value")
         self._reg("block_timestamp", "block_timestamp")
         self._reg("address_this", "address_this", bounded=False)
 
-        # ---- ALL storage variables registered upfront (old/new pairs) so
-        # invariants and guards can reference state this function never
-        # touches; untouched vars stay unconstrained unless constrained above.
         st_types = {v["name"]: str(v.get("type", "")) for v in self.analysis.get("storage_layout", [])}
         for sv in sorted(self.state_vars):
             self._scalar_pair(sv)
-            # Generic (quantified) slot for mappings: lets invariant authors
-            # write M[x] for arbitrary x. Free by default = sound havoc;
-            # invariant-mode pins new==old when the function cannot write it.
             if "mapping" in st_types.get(sv, ""):
                 zn = f"{_san(sv)}__GEN"
                 self._reg(f"{sv}[#]", zn)
@@ -257,7 +296,6 @@ class HarnessEncoder:
         valid_names = set(self.registry.values())
 
         def finalize(text: str, what: str):
-            """Read-substitute then validate; returns code or None (sound drop)."""
             sub = self._read_view(text, params)
             code, left = _translate(sub, set(self.registry.values()))
             if code is None:
@@ -267,20 +305,7 @@ class HarnessEncoder:
                 return None
             return code
 
-        def finalize_quiet(text: str) -> str | None:
-            """Same as finalize() but without quality/notes side effects —
-            used for branch-context probes whose failure is handled by the
-            caller (whole-context havoc, not silent drop)."""
-            try:
-                sub = self._read_view(text, params)
-                code, _left = _translate(sub, set(self.registry.values()))
-                return code
-            except Exception:
-                return None
-
         def finalize_cond(text: str) -> str | None:
-            """Condition translator for guards/branch contexts: supports
-            top-level '||'/'&&' chains. Returns None when unencodable."""
             try:
                 sub = self._read_view(text, params)
                 return _translate_condition(sub, set(self.registry.values()))
@@ -288,9 +313,6 @@ class HarnessEncoder:
                 return None
 
         def _z3_not(code: str) -> str:
-            """Collapses any leading python-'not' chain into z3 Not(...).
-            Polarity prefixes stack with '!'-translated bodies
-            (e.g. else-branch of 'if (!x)' -> 'not not x')."""
             s = code.strip()
             neg = False
             while s.startswith("not "):
@@ -299,10 +321,6 @@ class HarnessEncoder:
             return ("Not(" + s + ")") if neg else s
 
         def _wrap_when(when, params_ref, fin):
-            """Encodes a branch context list into Z3 condition strings.
-            Returns [] when unconditional, list of codes for encodable
-            contexts, or None when ANY entry is loop-derived/untranslatable
-            (caller havocks the affected constraint â€” sound)."""
             if not when:
                 return []
             codes = []
@@ -315,7 +333,6 @@ class HarnessEncoder:
                 codes.append(_z3_not(c))
             return codes
 
-        # ---- guards ----
         guard_codes = []
         for g in f.get("guards", []):
             text = g["text"] if isinstance(g, dict) else g
@@ -325,18 +342,15 @@ class HarnessEncoder:
                 continue
             wrapped = _wrap_when(when, params, finalize_cond)
             if wrapped is None:
-                # Guard only applies inside an unencodable context: dropping
-                # it weakens assumptions (sound over-approximation).
                 quality = MODEL_QUALITY_PARTIAL
                 untranslated.append(f"guard dropped (unencodable branch/loop context): {text}")
                 continue
             guard_codes.append(
                 f"Implies(And({', '.join(wrapped)}), ({code}))" if wrapped else code)
 
-        # ---- assignments ----
         trans_codes = []
-        written_pairs = []      # (new_zname, old_zname) for every state write
-        success_ctx = []        # distinct encodable contexts guarding writes
+        written_pairs = []
+        success_ctx = []
         any_unconditional_write = False
         assigns = f.get("assignments", [])
         ext_order = f.get("first_external_call_order")
@@ -344,21 +358,31 @@ class HarnessEncoder:
             op, lhs, rhs, order = a["op"], a["lhs"], a["rhs"], a["order"]
             when = a.get("when", [])
             if ext_order is not None and order >= ext_order:
-                quality = MODEL_QUALITY_PARTIAL
-                untranslated.append(
-                    f"external call at event {ext_order}: post-call write "
-                    f"'{lhs} {op} {rhs}' havocked (reentrancy may alter it)")
-                # Register the slot pair BEFORE havocking so the revert frame
-                # still covers it.
                 target, cur, kind = self._lhs_target(lhs, params)
                 if kind in ("scalar_state", "slot_state"):
                     written_pairs.append((target, cur))
+                resolved = None
+                for call_expr in f.get("external_calls", []):
+                    resolved = self._resolve_call_target(call_expr)
+                    if resolved:
+                        break
+                if resolved:
+                    _tkey, tfacts = resolved
+                    t_guards = self._encode_resolved_target_guards(tfacts, params)
+                    for tg in t_guards:
+                        guard_codes.append(tg)
+                    quality = MODEL_QUALITY_PARTIAL
+                    untranslated.append(
+                        f"external call resolved to {_tkey}: target guards "
+                        f"injected; post-call write '{lhs}' partially constrained")
+                else:
+                    quality = MODEL_QUALITY_PARTIAL
+                    untranslated.append(
+                        f"external call at event {ext_order}: post-call write "
+                        f"'{lhs} {op} {rhs}' havocked (reentrancy may alter it)")
                 continue
             wrapped = _wrap_when(when, params, finalize_cond)
             if wrapped is None:
-                # Write happens under a loop or untranslatable condition:
-                # its post-state stays unconstrained on the success path
-                # (sound havoc); the revert frame below still covers it.
                 quality = MODEL_QUALITY_PARTIAL
                 untranslated.append(
                     f"write havocked (loop/unencodable branch context): '{lhs} {op} {rhs}'")
@@ -370,8 +394,8 @@ class HarnessEncoder:
             if kind in ("scalar_state", "slot_state"):
                 written_pairs.append((target, cur))
                 if wrapped:
-                    key = tuple(sorted(wrapped))
-                    if key not in {tuple(sorted(s)) for s in success_ctx}:
+                    key_ctx = tuple(sorted(wrapped))
+                    if key_ctx not in {tuple(sorted(s)) for s in success_ctx}:
                         success_ctx.append(list(wrapped))
                 else:
                     any_unconditional_write = True
@@ -386,13 +410,6 @@ class HarnessEncoder:
             trans_codes.append(f"Implies(And({', '.join(wrapped)}), {eq})"
                                if wrapped else eq)
 
-        # ---- revert frame (transactional semantics) ----
-        # Every state write guarded by an encodable context either executes
-        # (context true -> transition above applies) or the call reverts and
-        # ALL storage stays at its pre-state (new == old). Without this, the
-        # fail-path leaves post-state unconstrained and every invariant looks
-        # violable by simply failing a require. Unconditional writes mean the
-        # function mutates state on every path we can see -> no framing.
         if (written_pairs and success_ctx and not any_unconditional_write):
             R = "Or(" + ", ".join(
                 (c[0] if len(c) == 1 else "And(" + ", ".join(c) + ")")
@@ -402,37 +419,52 @@ class HarnessEncoder:
 
         if f.get("loops"):
             quality = MODEL_QUALITY_PARTIAL
-            untranslated.append("function contains loops â€” iteration semantics not modeled")
+            untranslated.append("function contains loops — iteration semantics not modeled")
 
         if f.get("has_external_call") and quality == MODEL_QUALITY_FULL:
             quality = MODEL_QUALITY_PARTIAL
 
-        # ---- assemble ----
+        return {
+            "function_key": key,
+            "guard_codes": guard_codes,
+            "trans_codes": trans_codes,
+            "quality": quality,
+            "untranslated": untranslated[:20],
+            "registry": dict(self.registry),
+            "decls": list(self.decls),
+            "bounds": list(self.bounds),
+        }
+
+    def encode_function(self, focus_function: str) -> dict | None:
+        """Encodes a single function's state transition as a Z3 harness."""
+        raw = self._encode_raw(focus_function)
+        if raw is None:
+            return None
+
         lines = [
             "# ==== DETERMINISTIC SEMANTIC MODEL (generated by domain/semantics.py) ====",
-            f"# contract={self.contract} function={key} quality={quality}",
+            f"# contract={self.contract} function={raw['function_key']} quality={raw['quality']}",
             "# Soundness: unmodeled behavior is UNCONSTRAINED (over-approximation).",
             "from z3 import *",
             "",
             "def build_model():",
         ]
-        lines.extend(f"    {d}" for d in self.decls)
-        lines.append("    _bounds = [" + ", ".join(self.bounds) + "]")
-        lines.append("    _guards = [" + ", ".join(guard_codes) + "]")
-        lines.append("    _transitions = [" + ", ".join(trans_codes) + "]")
+        lines.extend(f"    {d}" for d in raw["decls"])
+        lines.append("    _bounds = [" + ", ".join(raw["bounds"]) + "]")
+        lines.append("    _guards = [" + ", ".join(raw["guard_codes"]) + "]")
+        lines.append("    _transitions = [" + ", ".join(raw["trans_codes"]) + "]")
         lines.append("    solver = Solver()")
         lines.append("    solver.add(_bounds + _guards + _transitions)")
-        # Map friendly keys to the ACTUAL z3 Int objects (not their names).
-        v_items = ", ".join(f"{k!r}: {z}" for k, z in self.registry.items())
+        v_items = ", ".join(f"{k!r}: {z}" for k, z in raw["registry"].items())
         lines.append("    V = {" + v_items + "}")
         lines.append("    return solver, V")
 
         return {
-            "function": key,
+            "function": raw["function_key"],
             "contract": self.contract,
-            "quality": quality,
+            "quality": raw["quality"],
             "code": "\n".join(lines),
-            "untranslated": untranslated[:20],
+            "untranslated": raw["untranslated"],
             "assumptions": [
                 "uint256 modeled as bounded Int [0, 2**256-1]: individual "
                 "variables are capped, so Z3 can detect when arithmetic results "
@@ -444,7 +476,95 @@ class HarnessEncoder:
                 "integer division truncation exact only for non-negative operands",
                 "mapping slots modeled per concrete index seen in source",
             ],
-            "symbols": dict(self.registry),
+            "symbols": raw["registry"],
+        }
+
+    def encode_function_sequence(self, function_names: list[str]) -> dict | None:
+        """Models an ordered sequence of function calls as a chained state
+        transition. Creates per-call variables (suffixed _c1, _c2, ...) with
+        bridge constraints: Call_N new_state == Call_N+1 old_state.
+
+        Returns a chain harness dict with quality CHAIN, or None on failure.
+        Soundness: same over-approximation policy as encode_function.
+        """
+        if len(function_names) < 2:
+            return None
+
+        all_decls: list[str] = []
+        all_bounds: list[str] = []
+        all_guards: list[str] = []
+        all_transitions: list[str] = []
+        merged_registry: dict[str, str] = {}
+        quality = MODEL_QUALITY_CHAIN
+        untranslated: list[str] = []
+        prev_new_map: dict[str, str] = {}  # base_var -> z3_new_name
+
+        for call_idx, fn_name in enumerate(function_names, 1):
+            sub = HarnessEncoder(self.analysis, suffix=f"_c{call_idx}")
+            raw = sub._encode_raw(fn_name)
+            if raw is None:
+                untranslated.append(f"function {fn_name} could not be encoded")
+                continue
+
+            all_decls.extend(raw["decls"])
+            all_bounds.extend(raw["bounds"])
+            all_guards.extend(raw["guard_codes"])
+            all_transitions.extend(raw["trans_codes"])
+
+            if call_idx > 1 and prev_new_map:
+                for sv in sorted(self.state_vars):
+                    new_key = f"{sv}@new_c{call_idx - 1}"
+                    old_key = f"{sv}_c{call_idx}"
+                    new_z = prev_new_map.get(new_key)
+                    old_z = raw["registry"].get(old_key)
+                    if new_z and old_z:
+                        all_transitions.append(f"{new_z} == {old_z}")
+
+            for sv in sorted(self.state_vars):
+                new_key_suf = f"{sv}@new_c{call_idx}"
+                new_z = raw["registry"].get(new_key_suf)
+                if new_z:
+                    prev_new_map[new_key_suf] = new_z
+
+            merged_registry.update(raw["registry"])
+            if raw["quality"] == MODEL_QUALITY_PARTIAL:
+                untranslated.extend(raw["untranslated"][:5])
+
+        if not all_decls:
+            return None
+
+        lines = [
+            "# ==== CHAIN DETERMINISTIC SEMANTIC MODEL ====",
+            f"# contract={self.contract} sequence={'->'.join(function_names)} quality={quality}",
+            "# Soundness: unmodeled behavior is UNCONSTRAINED (over-approximation).",
+            "# Bridge: Call_N post-state == Call_N+1 pre-state for all storage.",
+            "from z3 import *",
+            "",
+            "def build_model():",
+        ]
+        lines.extend(f"    {d}" for d in all_decls)
+        lines.append("    _bounds = [" + ", ".join(all_bounds) + "]")
+        lines.append("    _guards = [" + ", ".join(all_guards) + "]")
+        lines.append("    _transitions = [" + ", ".join(all_transitions) + "]")
+        lines.append("    solver = Solver()")
+        lines.append("    solver.add(_bounds + _guards + _transitions)")
+        v_items = ", ".join(f"{k!r}: {z}" for k, z in merged_registry.items())
+        lines.append("    V = {" + v_items + "}")
+        lines.append("    return solver, V")
+
+        return {
+            "function": "->".join(function_names),
+            "contract": self.contract,
+            "quality": quality,
+            "code": "\n".join(lines),
+            "untranslated": untranslated[:20],
+            "assumptions": [
+                "chain model: post-state of each call bridged to pre-state of next",
+                "each call independently over-approximates (PARTIAL quality possible)",
+                "uint256 modeled as bounded Int [0, 2**256-1]",
+                "external calls havocked per-call (reentrancy not modeled across chain)",
+            ],
+            "symbols": merged_registry,
         }
 
 

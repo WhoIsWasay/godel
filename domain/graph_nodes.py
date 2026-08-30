@@ -192,6 +192,33 @@ def bug_hunter_node(state: GraphState, inspector: Inspector):
     except Exception as e:
         logger.warning("compositional context generation failed (non-fatal): %s", e)
 
+    # --- Wrap probe signals: BitVec-256 overflow/underflow reachability ---
+    wrap_context = ""
+    wrap_signals = state.get("wrap_probe_signals")
+    if wrap_signals:
+        wrappable = [r for r in wrap_signals if r.get("wrap_reachable")]
+        if wrappable:
+            wrap_lines = ["<wrap_probe_signals>"]
+            wrap_lines.append("  WARNING: The following storage writes can overflow/underflow")
+            wrap_lines.append("  (BitVec-256 reachability confirmed; guards NOT assumed):")
+            for w in wrappable:
+                wrap_lines.append(f'  <wrappable write="{w["write"]}" />')
+            wrap_lines.append("  Investigate these as potential overflow/underflow vectors.")
+            wrap_lines.append("</wrap_probe_signals>")
+            wrap_context = "\n".join(wrap_lines)
+
+    # --- Paired CFG: cross-function reasoning for compositional pairs ---
+    paired_cfg_context = ""
+    paired_cfg = state.get("compositional_paired_cfg")
+    if paired_cfg:
+        paired_cfg_context = (
+            "\n=== COMPOSITIONAL PAIR CFG (cross-function reasoning permitted) ===\n"
+            f"{paired_cfg}\n"
+            "You MAY report findings whose exploit requires state changes in BOTH "
+            "functions shown above. The constraint must reference variables from both "
+            "CFG slices.\n"
+        )
+
     # Inject full contract reference, but STRICTLY bound the AI to the focus function
     input_text = f"""[CRITICAL INSTRUCTION]
 You are actively auditing the function named: `{focus_func}`.
@@ -204,6 +231,8 @@ A <cfg_abstraction> block may be present inside the isolation packet. It is DETE
 - If the block is absent or truncated, proceed from source only — do not invent CFG facts.
 
 {compositional_context}
+{wrap_context}
+{paired_cfg_context}
 === SYSTEM README ===
 {readme}
 
@@ -274,6 +303,18 @@ A <cfg_abstraction> block may be present inside the isolation packet. It is DETE
         "messages": [AIMessage(content=f"[BUG HUNTER]: Proposed {len(findings)} findings.")]
     }
 
+def _active_harness(state: GraphState) -> dict | None:
+    """Selects the best harness for the current finding: chain harness for
+    compositional findings when available, otherwise the single-function harness."""
+    finding = state.get("findings", [{}])[0] if state.get("findings") else {}
+    chain = state.get("compositional_harness")
+    if chain and (finding.get("class") == "compositional"
+                  or "->" in str(finding.get("target_function", ""))):
+        logger.info("[SPECIFIER] Using chain harness for compositional finding")
+        return chain
+    return state.get("semantic_harness")
+
+
 def specifier_node(state: GraphState, generator: PropertyGenerator):
     """Translates the finding into a Z3 property."""
     
@@ -293,7 +334,7 @@ def specifier_node(state: GraphState, generator: PropertyGenerator):
         {"intent": finding.get("intent", ""), "queries": rag_diag.get("queries", [])},
         state["user_contract"],
         rag_findings,
-        semantic_harness=state.get("semantic_harness"),
+        semantic_harness=_active_harness(state),
         repair_feedback=state.get("supervisor_critique"),
     )
     

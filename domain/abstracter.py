@@ -559,6 +559,147 @@ def render_cfg_slice(analysis: dict | None, focus_function: str,
     return block
 
 
+def render_paired_cfg_slice(analysis: dict | None, focus_function: str,
+                            paired_function: str,
+                            max_chars: int = 12000) -> str:
+    """Renders both the focus function's and the paired function's CFG slices
+    for cross-function compositional reasoning. Focus tagged
+    'focus_function_cfg', pair tagged 'compositional_pair_cfg'."""
+    if not analysis:
+        return ""
+    functions = analysis.get("functions", {})
+
+    def _resolve(name: str) -> str | None:
+        return next(
+            (k for k in functions if _base_name(k) == _base_name(name)),
+            None,
+        )
+
+    focus_key = _resolve(focus_function)
+    paired_key = _resolve(paired_function)
+    if focus_key is None or paired_key is None:
+        return ""
+
+    lines = []
+    lines.append(f'<cfg_abstraction contract="{analysis["contract"]}" '
+                 f'solc="{analysis.get("solc_version", "?")}">')
+
+    det = analysis.get("detectors", [])
+    if det:
+        lines.append("  <static_detector_signals>")
+        for d in det[:8]:
+            lines.append(f'    <signal impact="{d["impact"]}" check="{d["check"]}">{d["description"]}</signal>')
+        lines.append("  </static_detector_signals>")
+
+    for key, tag in [(focus_key, "focus_function_cfg"),
+                     (paired_key, "compositional_pair_cfg")]:
+        fdata = functions[key]
+
+        ordered = [key]
+        for callee in fdata.get("internal_calls", []):
+            callee_key = next((k for k in functions if k.split("(", 1)[0] == callee), None)
+            if callee_key and callee_key not in ordered:
+                ordered.append(callee_key)
+
+        for fn_key in ordered:
+            fd = functions[fn_key]
+            fn_tag = tag if fn_key == key else "callee_cfg"
+            lines.append(f'  <{fn_tag} signature="{fn_key}" visibility="{fd["visibility"]}"'
+                         + ("" if not fd["modifiers"] else f' modifiers="{" ".join(fd["modifiers"])}"')
+                         + f' nodes="{fd["nodes"]}" edges="{fd["edges"]}" loops="{fd["loops"]}"'
+                         + (' payable="true"' if fd.get("payable") else "") + ">")
+            if fd.get("state_writes"):
+                lines.append(f'    <storage_writes>{", ".join(fd["state_writes"])}</storage_writes>')
+            if fd.get("state_reads"):
+                lines.append(f'    <storage_reads>{", ".join(fd["state_reads"][:14])}</storage_reads>')
+            if fd.get("external_calls"):
+                lines.append(f'    <external_calls>{", ".join(fd["external_calls"])}</external_calls>')
+            if fd.get("internal_calls"):
+                lines.append(f'    <internal_calls>{", ".join(fd["internal_calls"])}</internal_calls>')
+            if fd.get("branches"):
+                lines.append("    <branch_conditions>")
+                for b in fd["branches"]:
+                    lines.append(f'      <branch kind="{b["kind"]}">{b["expr"]}</branch>')
+                lines.append("    </branch_conditions>")
+            lines.append(f"  </{fn_tag}>")
+
+    lines.append("</cfg_abstraction>")
+
+    block = "\n".join(lines)
+    if len(block) > max_chars:
+        marker = "\n...[cfg_abstraction truncated]"
+        block = block[:max_chars - len(marker)] + marker
+    return block
+
+
+def _has_external_calls(facts: dict) -> bool:
+    """True if function has external calls. Checks both the boolean flag
+    and the list (test mocks may only have one or the other)."""
+    if facts.get("has_external_call"):
+        return True
+    return bool(facts.get("external_calls"))
+
+
+def _state_in_guards(state_var: str, facts: dict) -> bool:
+    """True if any guard text references the state variable."""
+    for g in facts.get("guards", []):
+        text = g if isinstance(g, str) else g.get("text", "")
+        if state_var in text:
+            return True
+    return False
+
+
+def _state_in_arithmetic(state_var: str, facts: dict) -> bool:
+    """True if any assignment RHS uses the variable in an arithmetic op."""
+    for a in facts.get("assignments", []):
+        rhs = a.get("rhs", "")
+        if state_var in rhs and any(op in rhs for op in ("+", "-", "*", "/")):
+            return True
+    return False
+
+
+def _structural_risk(state_var: str, storage_layout: list,
+                     reader_facts: dict, writer_facts: dict) -> str:
+    """Structural-first risk classification for compositional candidates.
+
+    Priority order:
+    1. HIGH: reader has external calls AND reads shared state (drain vector)
+    2. MEDIUM: reader guards depend on shared state (access control bypass)
+    3. MEDIUM: storage type is mapping(address => ...) pattern
+    4. Keyword bonus: can upgrade low -> medium
+    5. LOW: generic shared state
+
+    Falls back to keyword matching when storage_layout or detailed facts
+    are unavailable (preserves compatibility with sparse test mocks).
+    """
+    reader_has_ext = _has_external_calls(reader_facts)
+    reader_reads = state_var in reader_facts.get("state_reads", [])
+
+    if reader_has_ext and reader_reads:
+        return "high"
+
+    if _state_in_guards(state_var, reader_facts):
+        return "medium"
+
+    if storage_layout:
+        for v in storage_layout:
+            if v.get("name") == state_var:
+                vtype = str(v.get("type", ""))
+                if "mapping" in vtype and "address" in vtype:
+                    return "medium"
+                if vtype == "mapping":
+                    return "medium"
+                break
+
+    var_lower = state_var.lower()
+    if any(kw in var_lower for kw in
+           ("owner", "admin", "role", "permission", "authorized",
+            "allowance", "approval", "approved", "balance", "balances")):
+        return "medium"
+
+    return "low"
+
+
 def detect_compositional_candidates(analysis: dict | None) -> list:
     """Identifies function pairs with shared state flow that could enable
     compositional attacks (e.g., approve sets allowance, flashLoan reads it).
@@ -610,19 +751,12 @@ def detect_compositional_candidates(analysis: dict | None) -> list:
                 if pair_key in seen_pairs:
                     continue
 
-                # Determine risk level based on state variable name patterns
-                risk = "low"
-                var_lower = state_var.lower()
-                if any(kw in var_lower for kw in ["allowance", "approval", "approved", "balance", "balances"]):
-                    # Check if reader does external calls or transfers
-                    reader_facts = functions.get(reader, {})
-                    if any(kw in str(reader_facts.get("external_calls", []))
-                           for kw in ["transfer", "call", "send", "delegatecall"]):
-                        risk = "high"
-                    else:
-                        risk = "medium"
-                elif any(kw in var_lower for kw in ["owner", "admin", "role", "permission", "authorized"]):
-                    risk = "medium"
+                reader_facts = functions.get(reader, {})
+                writer_facts = functions.get(writer, {})
+                risk = _structural_risk(
+                    state_var, analysis.get("storage_layout", []),
+                    reader_facts, writer_facts
+                )
 
                 candidates.append({
                     "writer": _base_name(writer),

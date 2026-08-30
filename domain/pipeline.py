@@ -395,6 +395,9 @@ def _process_function_inner(func, raw_solidity_code, stem, readme, env_setup, in
 
     cfg_block = ""
     harness = None
+    wrap_signals = None
+    paired_cfg_block = ""
+    chain_harness = None
     if static_analysis and not config.is_dry_run():
         cfg_block = render_cfg_slice(static_analysis, func["name"])
         if cfg_block:
@@ -404,6 +407,70 @@ def _process_function_inner(func, raw_solidity_code, stem, readme, env_setup, in
             print(f"      [SEMANTICS] deterministic model ready for {func['name']} "
                   f"(quality={harness['quality']}, untranslated={len(harness['untranslated'])})")
 
+        # Wrap probe: BitVec-256 overflow/underflow reachability for storage writes.
+        try:
+            from domain.wrap_probe import probe_function
+            functions = static_analysis.get("functions", {})
+            full_key = next((k for k in functions
+                             if k.split("(", 1)[0] == func["name"].split("(", 1)[0]), None)
+            if full_key:
+                wrap_signals = probe_function(static_analysis, full_key)
+                wrappable = [r for r in wrap_signals if r.get("wrap_reachable")]
+                if wrappable:
+                    print(f"      [WRAP PROBE] {func['name']}: {len(wrappable)} wrappable write(s)")
+        except Exception as e:
+            logger.warning("[WRAP PROBE] failed for %s (non-fatal): %s", func["name"], e)
+
+        # Compositional: detect candidates for paired CFG + chain harness.
+        try:
+            from domain.abstracter import detect_compositional_candidates, render_paired_cfg_slice
+            from domain.semantics import HarnessEncoder
+            candidates = detect_compositional_candidates(static_analysis)
+            focus_base = func["name"].split("(", 1)[0]
+            for cand in candidates:
+                if cand["risk"] not in ("high", "medium"):
+                    continue
+                if cand["writer"] == focus_base:
+                    paired_fn = cand["reader"]
+                elif cand["reader"] == focus_base:
+                    paired_fn = cand["writer"]
+                else:
+                    continue
+
+                paired_cfg_block = render_paired_cfg_slice(
+                    static_analysis, func["name"], paired_fn)
+                if paired_cfg_block:
+                    print(f"      [ABSTRACTER] Paired CFG for compositional analysis "
+                          f"({func['name']} <-> {paired_fn})")
+
+                if cand["risk"] == "high":
+                    sequence = [cand["writer"], cand["reader"]]
+                    try:
+                        encoder = HarnessEncoder(static_analysis)
+                        chain_harness = encoder.encode_function_sequence(sequence)
+                        if chain_harness:
+                            print(f"      [SEMANTICS] chain harness ready: "
+                                  f"{'->'.join(sequence)} "
+                                  f"(quality={chain_harness['quality']})")
+                    except Exception as e:
+                        logger.warning("[SEMANTICS] chain harness failed (non-fatal): %s", e)
+                break
+        except Exception as e:
+            logger.warning("[COMPOSITIONAL] pipeline integration failed for %s "
+                           "(non-fatal): %s", func["name"], e)
+
+    wrap_xml = ""
+    if wrap_signals:
+        wrappable = [r for r in wrap_signals if r.get("wrap_reachable")]
+        if wrappable:
+            lines = ["  <wrap_probe_signals>"]
+            lines.append("    WARNING: The following storage writes can overflow/underflow")
+            lines.append("    (BitVec-256 reachability confirmed; guards NOT assumed):")
+            for w in wrappable:
+                lines.append(f'    <wrappable write="{w["write"]}" />')
+            lines.append("  </wrap_probe_signals>")
+            wrap_xml = "\n".join(lines)
+
     injection_packet = f"""<analysis_packet>
     <environment_wiring>
         <setup>{env_setup}</setup>
@@ -411,6 +478,7 @@ def _process_function_inner(func, raw_solidity_code, stem, readme, env_setup, in
         <global_storage_slots>{state_vars}</global_storage_slots>
     </environment_wiring>
 {cfg_block}
+{wrap_xml}
     <target_isolated_function>
 {func['body']}
     </target_isolated_function>
@@ -443,6 +511,10 @@ def _process_function_inner(func, raw_solidity_code, stem, readme, env_setup, in
         "forge_output": "",
         "qc_status": "",
         "isolated_xml_packet": injection_packet,
+        "wrap_probe_signals": wrap_signals,
+        "compositional_paired_cfg": paired_cfg_block or None,
+        "compositional_harness": chain_harness,
+        "compositional_model_quality": chain_harness["quality"] if chain_harness else None,
     }
 
     return app.invoke(initial_state)

@@ -90,3 +90,16 @@ class GraphState(TypedDict):
     poc_test_code : str
     forge_output : str
     qc_status : str
+
+    # Wrap probe: BitVec-256 overflow/underflow reachability signals
+    # from domain.wrap_probe. None when unavailable or no wrappable writes.
+    wrap_probe_signals: Optional[list]
+
+    # Dual-CFG injection: paired function's CFG slice for cross-function
+    # reasoning when a compositional pair is flagged (Gap 2).
+    compositional_paired_cfg: Optional[str]
+
+    # Multi-call chain harness: Z3 model for writer->reader sequences
+    # (Gap 3). None when no high-risk compositional pair exists.
+    compositional_harness: Optional[dict]
+    compositional_model_quality: Optional[str]
