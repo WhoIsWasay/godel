@@ -45,6 +45,7 @@ broadcast/
 
 # Pipeline-generated output (findings, reports, proofs, fixes, submissions)
 output/
+output-grandtest/
 lendingPool/
 *.xml
 

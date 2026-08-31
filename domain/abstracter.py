@@ -826,7 +826,7 @@ def render_compositional_context(analysis: dict | None, focus_function: str) -> 
 
     lines.append("  Consider how state changes in the writer could be exploited by the reader,")
     lines.append("  or how the reader's logic depends on state set by the writer.")
-    lines.append("  Analyze BOTH functions together to detect compositional vulnerabilities.")
+    lines.append("  Consider how this function's behavior could be exploited in combination with the paired function above.")
     lines.append("</compositional_context>")
 
     return "\n".join(lines)
