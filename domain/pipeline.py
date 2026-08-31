@@ -618,15 +618,39 @@ def route_after_fixer(state: GraphState) -> str:
     return END
 
 
-def build_godel_graph():
+def build_godel_graph(checkpoint_dir: str | None = None, memory_saver=None):
+    """Compile the Gödel graph.
+
+    Parameters
+    ----------
+    checkpoint_dir : str | None
+        If provided, a FileCheckpointer writes a JSON snapshot of the graph
+        state after every node. Recovery after hard crashes:
+            `state = recover_state(checkpoint_dir); app.invoke(state)`.
+    memory_saver : langgraph.checkpoint.base.BaseCheckpointSaver | None
+        If provided, passed to `workflow.compile(checkpointer=...)` so the
+        graph supports in-process resume via a `thread_id` in the config.
+        Use `build_memory_saver()` from domain.checkpoint for the default
+        in-memory implementation.
+    """
     workflow = StateGraph(GraphState)
 
-    workflow.add_node("supervisor", node_supervisor)
-    workflow.add_node("bug_hunter", node_bug_hunter)
-    workflow.add_node("specifier", node_specifier)
-    workflow.add_node("executor", node_executor)
-    workflow.add_node("gatekeeper", node_gatekeeper)
-    workflow.add_node("fixer", node_fixer)
+    node_fns = {
+        "supervisor": node_supervisor,
+        "bug_hunter": node_bug_hunter,
+        "specifier": node_specifier,
+        "executor": node_executor,
+        "gatekeeper": node_gatekeeper,
+        "fixer": node_fixer,
+    }
+
+    if checkpoint_dir:
+        from domain.checkpoint import FileCheckpointer, wrap_nodes_with_file_checkpointer
+        ckpt = FileCheckpointer(checkpoint_dir)
+        node_fns = wrap_nodes_with_file_checkpointer(node_fns, ckpt)
+
+    for name, fn in node_fns.items():
+        workflow.add_node(name, fn)
 
     workflow.add_conditional_edges(
         "bug_hunter",
@@ -666,7 +690,10 @@ def build_godel_graph():
 
     workflow.set_entry_point("bug_hunter")
 
-    return workflow.compile()
+    compile_kwargs = {}
+    if memory_saver is not None:
+        compile_kwargs["checkpointer"] = memory_saver
+    return workflow.compile(**compile_kwargs)
 
 
 # ==========================================
