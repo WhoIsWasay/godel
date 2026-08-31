@@ -88,7 +88,7 @@ FORBIDDEN in harness mode:
 - Do NOT use Array/Store/Select (mappings are pre-modeled in V)
 - Steps 3, 5, 5.5 of the general prompt are OVERRIDDEN — the harness replaces them
 
-Available V symbols: {sorted(semantic_harness.get('symbols', {{}}).keys())}
+Available V symbols: {sorted(semantic_harness.get('symbols', dict()).keys())}
 Use ONLY these symbols. If the property cannot be expressed with them, output [SUPERVISOR_ALERT].
 
 SANITY probe is MANDATORY:
