@@ -244,7 +244,7 @@ class _FakeCEGIS:
     def __init__(self, result):
         self._result = result
 
-    def run_with_repair(self, z3_code, max_repairs=None):
+    def run_with_repair(self, z3_code, max_repairs=None, **kwargs):
         return self._result
 
 

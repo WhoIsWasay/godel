@@ -433,9 +433,18 @@ def executor_node(state: GraphState, cegis_tool: CEGIS):
         }
 
     print(f"      [EXECUTOR] Running symbolic execution (Iteration {state.get('iterations', 0)})...")
-    result = cegis_tool.run_with_repair(z3_code)
+    harness = _active_harness(state) or {}
+    known_symbols = sorted((harness.get("symbols") or {}).keys())
+    result = cegis_tool.run_with_repair(
+        z3_code,
+        known_symbols=known_symbols,
+        focus_function=state.get("current_focus_function"),
+    )
     if result.get("repairs_used"):
         print(f"      [CEGIS] {result['repairs_used']} repair(s) applied inside executor")
+    if result.get("deterministic_repairs"):
+        print(f"      [CEGIS] {result['deterministic_repairs']} deterministic "
+              f"NameError fix(es) applied without LLM")
 
     updates = {
         "z3_result": result,

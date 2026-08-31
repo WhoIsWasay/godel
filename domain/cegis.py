@@ -19,7 +19,7 @@ import re
 
 from langchain_core.messages import SystemMessage, HumanMessage
 
-from domain import config
+from domain import config, z3_repair
 from domain.llm_utils import call_with_retry, content_to_text, guarded_invoke
 
 logger = logging.getLogger(__name__)
@@ -36,29 +36,76 @@ class CEGIS:
         self.run_z3 = run_z3_tool
 
     # ------------------------------------------------------------- main API
-    def run_with_repair(self, z3_code: str, max_repairs: int = None) -> dict:
+    def run_with_repair(self, z3_code: str, max_repairs: int = None,
+                        known_symbols=None, focus_function: str = None) -> dict:
+        """Runs a Z3 property script with layered repair:
+
+        1. Deterministic preflight (z3_repair.preflight_fix) patches
+           statically-detectable undefined names BEFORE the first execution.
+        2. On a runtime NameError, z3_repair.repair_name_error fixes it
+           WITHOUT an LLM round-trip and does not consume the repair budget.
+        3. Any other error falls back to the bounded LLM guided repair.
+
+        Every error/repair is persisted to config.DEBUG_FOLDER so runs are
+        diagnosable after the fact."""
         if max_repairs is None:
             max_repairs = max(1, config.EXECUTOR_MAX_ITERATIONS // 2)
 
+        attempts = []
+
+        preflight = z3_repair.preflight_fix(z3_code, known_symbols=known_symbols)
+        if preflight and preflight != z3_code:
+            z3_code = preflight
+            attempts.append({"phase": "preflight", "kind": "deterministic"})
+            print("      [CEGIS] preflight: undefined symbols fixed "
+                  "deterministically (no LLM)")
+
         result = self.run_z3(z3_code)
-        repairs = 0
+        attempts.append({"phase": "run", "status": result.get("status"),
+                         "error": result.get("error")})
+
+        repairs = 0          # LLM repairs (bounded by max_repairs)
+        deterministic = 0    # LLM-free NameError fixes (bounded too)
         while result.get("status") == "error" and repairs < max_repairs:
-            print(f"      [CEGIS] Z3 error — guided repair attempt "
-                  f"{repairs + 1}/{max_repairs}")
-            fixed = self._repair_script(z3_code, result.get("error") or "")
+            error = result.get("error") or ""
+            fixed = None
+            kind = None
+            if deterministic < max_repairs:
+                fixed = z3_repair.repair_name_error(z3_code, error, known_symbols)
+                if fixed:
+                    kind = "deterministic"
+                    deterministic += 1
             if not fixed:
-                logger.warning("[CEGIS] repair LLM returned no usable code")
-                break
+                print(f"      [CEGIS] Z3 error — guided repair attempt "
+                      f"{repairs + 1}/{max_repairs}")
+                fixed = self._repair_script(z3_code, error)
+                if not fixed:
+                    logger.warning("[CEGIS] repair LLM returned no usable code")
+                    attempts.append({"phase": "repair", "kind": "llm",
+                                     "error": "LLM returned no usable code"})
+                    break
+                kind = "llm"
+                repairs += 1
+            else:
+                print(f"      [CEGIS] Z3 error — deterministic NameError fix "
+                      f"applied (no LLM call)")
             z3_code = fixed
             result = self.run_z3(z3_code)
-            repairs += 1
+            attempts.append({"phase": "repair", "kind": kind,
+                             "status": result.get("status"),
+                             "error": result.get("error")})
 
         result["repairs_used"] = repairs
+        result["deterministic_repairs"] = deterministic
         if result.get("status") == "sat":
             result["counterexample"] = self.extract_counterexample(
                 result.get("output") or "")
         else:
             result["counterexample"] = None
+
+        if attempts:
+            z3_repair.persist_repair_log(config.DEBUG_FOLDER, focus_function,
+                                         attempts, result)
         return result
 
     # ------------------------------------------------------------ internals
