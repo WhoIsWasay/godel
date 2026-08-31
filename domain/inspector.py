@@ -157,14 +157,27 @@ class Inspector:
                         else True
                     )
 
+                    strong_code_overlap = False
+                    if finding_code_lines and existing_code_lines:
+                        intersection = finding_code_lines & existing_code_lines
+                        smaller = min(len(finding_code_lines), len(existing_code_lines))
+                        if smaller > 0 and len(intersection) >= smaller:
+                            strong_code_overlap = True
+
                     intent_sim = self._word_overlap_ratio(
                         finding.get("intent", ""), existing.get("intent", "")
                     )
 
-                    # TRIGGER: Matches the same code execution point AND contains highly similar intent
-                    if (
-                        has_code_overlap
-                        and intent_sim > intent_similarity_threshold
+                    constraint_sim = self._word_overlap_ratio(
+                        finding.get("constraint", ""), existing.get("constraint", "")
+                    )
+
+                    threshold = intent_similarity_threshold
+                    if strong_code_overlap:
+                        threshold = 0.15
+
+                    if has_code_overlap and (
+                        intent_sim > threshold or constraint_sim > 0.5
                     ):
                         is_dup = True
                         break

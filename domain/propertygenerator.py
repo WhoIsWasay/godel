@@ -63,18 +63,41 @@ class PropertyGenerator:
         if semantic_harness:
             from domain.semantics import PROPERTY_PROTOCOL_COMMENT
             harness_section = f"""
-        === DETERMINISTIC SEMANTIC MODEL (authoritative — generated from static analysis) ===
-        ```python
-        {semantic_harness['code']}
-        ```
-        Model quality: {semantic_harness['quality']}.
-        Unmodeled (havocked, i.e. free) parts: {json.dumps(semantic_harness['untranslated'], indent=2)}
-        Standing assumptions: {json.dumps(semantic_harness['assumptions'])}
+=== DETERMINISTIC SEMANTIC MODEL (authoritative — generated from static analysis) ===
+```python
+{semantic_harness['code']}
+```
+Model quality: {semantic_harness['quality']}.
+Unmodeled (havocked, i.e. free) parts: {json.dumps(semantic_harness['untranslated'], indent=2)}
+Standing assumptions: {json.dumps(semantic_harness['assumptions'])}
 
-        {PROPERTY_PROTOCOL_COMMENT}
-        You MUST use build_model() and the V[...] symbols. Do NOT re-declare state
-        variables or invent semantics that contradict the model.
-        """
+{PROPERTY_PROTOCOL_COMMENT}
+
+[CRITICAL — HARNESS MODE ACTIVE]
+The model above is AUTHORITATIVE. Your script MUST:
+1. Start with: solver, V = build_model()
+2. Write the property using ONLY V[...] symbols (e.g., V['arg_amount'], V['allowance@new'])
+3. Add the negated property: solver.add(Not(<property over V symbols>))
+4. Check: if solver.check() == sat: print("BUG FOUND:", solver.model()) else: print("Property holds")
+
+FORBIDDEN in harness mode:
+- Do NOT declare your own Int/BitVec variables (no `amount = BitVec(...)`)
+- Do NOT create your own Solver() (use the one from build_model())
+- Do NOT re-encode Solidity semantics (the model already encodes them)
+- Do NOT use Array/Store/Select (mappings are pre-modeled in V)
+- Steps 3, 5, 5.5 of the general prompt are OVERRIDDEN — the harness replaces them
+
+Available V symbols: {sorted(semantic_harness.get('symbols', {{}}).keys())[:20]}
+Use ONLY these symbols. If the property cannot be expressed with them, output [SUPERVISOR_ALERT].
+
+SANITY probe is MANDATORY:
+```
+solver.push()
+print("SANITY:", solver.check())
+solver.pop()
+```
+Then add the property and check.
+"""
         else:
             harness_section = """
         No deterministic model is available for this function: encode the Solidity

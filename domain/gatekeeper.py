@@ -27,7 +27,7 @@ def is_compile_failure(combined_output: str, stdout: str) -> bool:
     return any(m in combined_output for m in markers) and not has_executed_tests(stdout)
 
 
-def classify_forge_json(stdout_text: str):
+def classify_forge_json(stdout_text: str, combined_output: str = ""):
     """Structured verdict from a `forge test --json` report.
 
     Returns (verdict, n_tests) with verdict in {'confirmed', 'property_held',
@@ -36,7 +36,19 @@ def classify_forge_json(stdout_text: str):
     version drift by collecting every boolean 'success' field anywhere in the
     document instead of assuming a fixed schema. Newer forge versions replace
     the boolean 'success' field with 'status': 'Success'/'Failure' — both are
-    collected."""
+    collected.
+
+    setUp failures (vm.etch precompile, selector errors, etc.) are classified
+    as harness_error, NOT confirmed — a test that never ran cannot disprove
+    an invariant."""
+    setUp_error_markers = (
+        "setUp failed", "Setup failed", "SETUP FAILED",
+        "vm.etch: cannot use precompile", "does not have the selector",
+        "failed to set up invariant", "setUp() must be",
+    )
+    if any(m in combined_output for m in setUp_error_markers):
+        return ("harness_error", 0)
+
     s = (stdout_text or "").strip()
     if not (s.startswith("{") or s.startswith("[")):
         return None
@@ -49,9 +61,6 @@ def classify_forge_json(stdout_text: str):
 
     def _walk(node, key=None):
         if key == "traces":
-            # Trace arena nodes carry per-CALL success flags; an inner
-            # reverted call (vm.expectRevert, try/catch) inside a PASSING
-            # test would falsely confirm the suite.
             return
         if isinstance(node, dict):
             status = node.get("status")
@@ -299,7 +308,7 @@ class FoundryGatekeeper:
                     # 2c. STRUCTURED VERDICT: when forge produced a valid JSON
                     # report, classify from it (robust against prose changes
                     # in human-readable output). None -> legacy heuristics.
-                    structured = classify_forge_json(stdout)
+                    structured = classify_forge_json(stdout, combined_output)
                     if structured is not None:
                         verdict, n_tests = structured
                         self._dump_debug_artifact(debug_tag, attempt, current_test_code, combined_output, debug_dir)
@@ -313,6 +322,15 @@ class FoundryGatekeeper:
 
                     # 3. SUCCESSFUL EXECUTION: Did the property break? (Bug Proven)
                     if result.returncode != 0 and "FAIL" in stdout:
+                        setUp_markers = ("setUp failed", "Setup failed",
+                                         "vm.etch: cannot use precompile",
+                                         "does not have the selector",
+                                         "failed to set up invariant")
+                        if any(m in combined_output for m in setUp_markers):
+                            print("      [GATEKEEPER ERROR] Test failed at setUp — "
+                                  "harness problem, NOT a confirmed bug.")
+                            self._dump_debug_artifact(debug_tag, attempt, current_test_code, combined_output, debug_dir)
+                            return "harness_error", combined_output
                         print("      [QC PASSED] Invariant broken successfully. Defect is active and verified!")
                         self._dump_debug_artifact(debug_tag, attempt, current_test_code, combined_output, debug_dir)
                         return "confirmed", combined_output
