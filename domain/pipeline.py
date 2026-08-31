@@ -839,14 +839,11 @@ def _verify_compositor_finding(finding: dict, raw_contract: str, stem: str,
     }
 
     try:
-        from domain.graph_nodes import (
-            node_specifier, node_executor, node_gatekeeper, node_fixer,
-            route_after_specifier, route_after_executor,
-            route_after_gatekeeper, route_after_fixer,
-        )
         from langgraph.graph import StateGraph, END
         from domain.state import GraphState
 
+        # node_specifier, node_executor, node_gatekeeper, node_fixer, and all
+        # route_after_* functions are defined in this module (pipeline.py).
         verify_graph = StateGraph(GraphState)
         verify_graph.add_node("specifier", node_specifier)
         verify_graph.add_node("executor", node_executor)

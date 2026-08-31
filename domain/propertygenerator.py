@@ -70,6 +70,7 @@ class PropertyGenerator:
 Model quality: {semantic_harness['quality']}.
 Unmodeled (havocked, i.e. free) parts: {json.dumps(semantic_harness['untranslated'], indent=2)}
 Standing assumptions: {json.dumps(semantic_harness['assumptions'])}
+{"IMPORTANT: This model is PARTIAL quality — some guards/transitions are havocked (unconstrained). SAT results may be false positives from the over-approximation. Be extra careful: only flag BUG FOUND when the counterexample makes sense given the unmodeled parts listed above." if semantic_harness["quality"] == "PARTIAL" else ""}
 
 {PROPERTY_PROTOCOL_COMMENT}
 
@@ -87,7 +88,7 @@ FORBIDDEN in harness mode:
 - Do NOT use Array/Store/Select (mappings are pre-modeled in V)
 - Steps 3, 5, 5.5 of the general prompt are OVERRIDDEN — the harness replaces them
 
-Available V symbols: {sorted(semantic_harness.get('symbols', {{}}).keys())[:20]}
+Available V symbols: {sorted(semantic_harness.get('symbols', {{}}).keys())}
 Use ONLY these symbols. If the property cannot be expressed with them, output [SUPERVISOR_ALERT].
 
 SANITY probe is MANDATORY:

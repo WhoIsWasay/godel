@@ -359,7 +359,7 @@ def _handle_unsat_verdict(state: GraphState, updates: dict) -> None:
     probe it for vacuity (an unreachable model makes UNSAT meaningless).
     Harness-less scripts are covered by the mandatory SANITY sentinel probe
     enforced in z3_runner, so a plain UNSAT there is trusted."""
-    harness = state.get("semantic_harness")
+    harness = _active_harness(state)
     if harness and harness.get("code"):
         vac_script = compose_reachability_script(harness)
         vac_result = run_z3(vac_script)
@@ -627,12 +627,16 @@ def fixer_node(state: GraphState, fixer: FixerAgent, formatter: SubmissionFormat
             # `forge install foundry-rs/forge-std` inside the artifact folder.
             toml_path = os.path.join(folder_path, "foundry.toml")
             if not os.path.exists(toml_path):
+                import re as _re
+                pragma_m = _re.search(r"pragma solidity\s+\^?(\d+\.\d+\.\d+)",
+                                      state.get("user_contract", ""))
+                solc_ver = pragma_m.group(1) if pragma_m else "0.8.19"
                 with open(toml_path, "w", encoding="utf-8") as f:
                     f.write("[profile.default]\n"
                             'src = "src"\n'
                             'out = "out"\n'
                             'libs = ["lib"]\n'
-                            'solc_version = "0.8.19"\n')
+                            f'solc_version = "{solc_ver}"\n')
 
         print(f"Successfully created folder '{folder_path}' and wrote {len(files_to_write)} files.")
             

@@ -314,8 +314,16 @@ class FoundryGatekeeper:
                         self._dump_debug_artifact(debug_tag, attempt, current_test_code, combined_output, debug_dir)
                         if verdict == "confirmed":
                             print(f"      [QC PASSED] Invariant broken in JSON report ({n_tests} result(s)). Defect is active and verified!")
+                            return verdict, combined_output
                         elif verdict == "property_held":
                             print(f"      [QC FAILED] {n_tests} test(s) ran clean but property held (no bug found). Discarding noise.")
+                            return verdict, combined_output
+                        elif verdict == "harness_error" and attempt < max_retries and self.verifier_agent:
+                            print("      [CEGIS WARNING] setUp failure detected. Feeding error back to AI for healing...")
+                            heal_error = combined_output + "\n\nSETUP ERROR: The test failed during setUp(), not during invariant checking. Fix the setUp() function — common causes: vm.etch on precompile addresses (0x1-0x9), wrong constructor arguments, missing mock setup."
+                            current_test_code = self.verifier_agent.heal_test_suite(
+                                current_test_code, heal_error, legacy=legacy)
+                            continue
                         else:
                             print("      [GATEKEEPER ERROR] JSON report contained zero test results — harness problem.")
                         return verdict, combined_output

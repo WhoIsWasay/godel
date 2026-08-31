@@ -68,6 +68,10 @@ _INLINE_SYSTEM_PROMPT = """<verification_engineer_directive>
             4. After the final transaction, assert the SAFE invariant per Law 4 (a real bug then makes the test FAIL).
             Prefer this explicit-sequence style whenever the trace provides concrete values; use fuzz/invariant mode only for single-call properties.
         </law>
+
+        <law id="10" title="NO PRECOMPILE ETCHING">
+            NEVER use vm.etch() on addresses 0x1 through 0x9 (EVM precompiles: ecRecover, SHA-256, RIPEMD-160, identity, modexp, ecAdd, ecMul, ecPairing, blake2f). Foundry will reject this with "vm.etch: cannot use precompile." If you need to mock a token or dependency, deploy it with `new` and use its actual address. Use vm.deal(vm.addr, amount) to fund actors instead of etching code into their address.
+        </law>
     </critical_execution_laws>
 </verification_engineer_directive>"""
 
