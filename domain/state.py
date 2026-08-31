@@ -71,6 +71,12 @@ class GraphState(TypedDict):
     # Bounded retries when the Isolator response is unparseable (previously a
     # parse failure dead-ended the function's audit with zero recovery)
     hunter_retries: int
+
+    # Set by bug_hunter_node when ALL passes returned empty provider
+    # responses (EmptyResponseError or empty-after-think-strip). Signals
+    # the router to short-circuit outer retries — retrying on quota or
+    # rate-limit exhaustion only burns API credits without producing output.
+    hunter_provider_empty: Optional[bool]
     
     # RAG retrieval diagnostics (scores + P@K) captured by the specifier node
     rag_diagnostics: Optional[dict]

@@ -545,6 +545,18 @@ def node_fixer(state: GraphState): return fixer_node(state, fixer, formatter)
 # GRAPH ROUTING LOGIC (Escalation Pipeline)
 # ==========================================
 def route_after_hunter(state: GraphState) -> str:
+    # Provider-exhaustion short circuit: when every pass came back empty
+    # (EmptyResponseError or empty-after-think-strip), the root cause is
+    # almost always quota / rate-limit / billing / content-filter — retrying
+    # the same call burns credits without changing the outcome. Go straight
+    # to END and let the outer audit continue with the functions it could
+    # analyze; this one is flagged via hunter_parse_error in the artifact.
+    if state.get("hunter_provider_empty"):
+        logger.error("[ROUTING] Provider returned empty responses on all passes "
+                     "(likely quota/rate-limit exhaustion) — skipping outer "
+                     "retry to save API credits. Function %s is marked as "
+                     "analysis_failed.", state.get('current_focus_function'))
+        return END
     if state.get("hunter_parse_error") and not state.get("findings"):
         # Unparseable Isolator output must never masquerade as 'safe', and it
         # should not dead-end either — retry bounded by hunter_retries.

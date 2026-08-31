@@ -87,7 +87,17 @@ def supervisor_node(state: GraphState, llm_pro):
 
 
 def _parse_hunter_output(raw_response: str, inspector: Inspector):
-    """Robust JSON extraction for one hunter pass. Returns (findings, parse_error)."""
+    """Robust JSON extraction for one hunter pass.
+
+    Returns (findings, parse_error, provider_empty):
+      - findings: list of dicts extracted from the response (may be empty).
+      - parse_error: human-readable error string, or None on success.
+      - provider_empty: True iff the provider returned no usable payload
+        (empty string, only <think>...</think> reasoning, or only empty
+        markdown fences). This signal is distinct from "garbage JSON"
+        so the caller can short-circuit outer retries — retrying on
+        quota/rate-limit exhaustion only burns credits.
+    """
     findings = []
     parse_error = None
     clean_response = re.sub(r'<think>.*?</think>', '', raw_response, flags=re.DOTALL).strip()
@@ -97,7 +107,7 @@ def _parse_hunter_output(raw_response: str, inspector: Inspector):
     # Catch the empty result here with a clear diagnostic instead of letting
     # json.loads('') cascade through three fallback layers as "char 0".
     if not clean_response:
-        return [], "LLM response was empty after <think>-strip (reasoning-only output, no JSON payload)"
+        return [], "LLM response was empty after <think>-strip (reasoning-only output, no JSON payload)", True
 
     try:
         if "```json" in clean_response:
@@ -106,7 +116,7 @@ def _parse_hunter_output(raw_response: str, inspector: Inspector):
             clean_response = clean_response.split("```")[1].split("```")[0].strip()
 
         if not clean_response:
-            return [], "LLM response contained only markdown fences with no JSON payload"
+            return [], "LLM response contained only markdown fences with no JSON payload", True
 
         # strict=False fixes the "Invalid control character" error natively
         parsed_data = json.loads(clean_response, strict=False)
@@ -135,7 +145,7 @@ def _parse_hunter_output(raw_response: str, inspector: Inspector):
         parse_error = "Isolator output 'findings' was not a list."
 
     findings = [f for f in findings if isinstance(f, dict)]
-    return findings, parse_error
+    return findings, parse_error, False
 
 
 def bug_hunter_node(state: GraphState, inspector: Inspector):
@@ -273,7 +283,10 @@ A <cfg_abstraction> block may be present inside the isolation packet. It is DETE
     passes = max(1, config.HUNTER_PASSES)
     all_findings = []
     parse_errors = []
+    empty_passes = 0
+    total_passes_attempted = 0
     for pass_i in range(passes):
+        total_passes_attempted += 1
         try:
             raw_response = inspector._invoke(inspector.isolator_agent, inspector.isolator_prompt, input_text)
         except EmptyResponseError as e:
@@ -281,12 +294,26 @@ A <cfg_abstraction> block may be present inside the isolation packet. It is DETE
             # low-level retries. Record it; other passes may still deliver.
             logger.error("[BUG HUNTER EMPTY RESPONSE] pass %d: %s", pass_i + 1, e)
             parse_errors.append(f"pass {pass_i + 1}: empty responses after retries ({e})")
+            empty_passes += 1
             continue
-        found, err = _parse_hunter_output(raw_response, inspector)
+        found, err, provider_empty = _parse_hunter_output(raw_response, inspector)
         all_findings.extend(found)
+        if provider_empty:
+            empty_passes += 1
         if err:
             parse_errors.append(f"pass {pass_i + 1}: {err}")
+            if provider_empty:
+                # Surface a visible diagnostic (not just logger) so the CI
+                # log makes the root cause obvious instead of the cryptic
+                # "char 0" cascade.
+                print(f"      [BUG HUNTER PROVIDER EMPTY] pass {pass_i + 1}: {err}")
     
+    # If EVERY pass came back empty (either EmptyResponseError or empty-after-
+    # think-strip), signal the router to short-circuit — outer retries on
+    # quota/rate-limit exhaustion only burn credits without producing output.
+    hunter_provider_empty = (total_passes_attempted > 0
+                             and empty_passes == total_passes_attempted)
+
     findings = all_findings
     if passes > 1 and len(findings) > 1:
         for i, f in enumerate(findings, start=1):
@@ -317,6 +344,7 @@ A <cfg_abstraction> block may be present inside the isolation packet. It is DETE
         "findings": findings,
         "hunter_parse_error": parse_error,
         "hunter_retries": (retry_n + 1) if parse_error else 0,
+        "hunter_provider_empty": hunter_provider_empty,
         "messages": [AIMessage(content=f"[BUG HUNTER]: Proposed {len(findings)} findings.")]
     }
 
