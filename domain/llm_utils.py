@@ -19,6 +19,28 @@ def guarded_invoke(agent, messages):
         return agent.invoke(messages)
 
 
+def content_to_text(content) -> str:
+    """Normalize an LLM response .content payload to a plain string.
+
+    Providers increasingly return block-structured content (a list of
+    {"type": "text", "text": ...} dicts) instead of a bare str; calling
+    .strip() on a list crashed the node. Every call site should normalize
+    through this before string processing."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+        return "".join(parts)
+    return str(content)
+
+
 # HTTP status codes that retrying can never fix (auth, bad request, billing,
 # context length). Everything else (429, 5xx, timeouts, connection resets)
 # is considered transient.

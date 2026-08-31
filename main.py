@@ -144,7 +144,7 @@ def run_discovery(args) -> int:
             finding = {
                 "contract": result["contract"],
                 "function": (b["violated_by"] or ["contract-level"])[0],
-                "severity": "high",
+                "severity": "medium",
                 "title": f"Invariant broken: {b['invariant']}",
                 "summary": f"Discovered invariant '{b['invariant']}' is violated.",
                 "root_cause": b["invariant"],

@@ -6,7 +6,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from domain import config
 from domain.config import PROMPTS_DIR
-from domain.llm_utils import EmptyResponseError, call_with_retry, guarded_invoke
+from domain.llm_utils import (EmptyResponseError, call_with_retry,
+                              content_to_text, guarded_invoke)
 
 
 class Inspector:
@@ -30,7 +31,7 @@ class Inspector:
                     HumanMessage(content=user_input),
                 ],
             )
-            content = (response.content or "").strip()
+            content = content_to_text(response.content).strip()
             if not content:
                 # An HTTP-200 with no content is a transient provider fault,
                 # NOT a real "no findings" answer. Retry it.
@@ -56,8 +57,9 @@ class Inspector:
                 self.isolator_agent, self.isolator_prompt, isolator_input
             )
             result = self.extract_json(raw)
-            all_isolated.extend(result["findings"])
-            print(f"   Run {i+1}: {len(result['findings'])} findings")
+            findings = result.get("findings") or []
+            all_isolated.extend(f for f in findings if isinstance(f, dict))
+            print(f"   Run {i+1}: {len(findings)} findings")
 
         # Now leveraging the line intersection + Jaccard overlap deduplicator
         isolated_deduped = self.deduplicate(all_isolated)
@@ -69,12 +71,12 @@ class Inspector:
         # Slim findings for Compositor — only essential fields
         slim_findings = [
             {
-                "id": f["id"],
-                "intent": f["intent"],
-                "target_function": f["target_function"],
-                "class": f["class"],
+                "id": f.get("id", idx),
+                "intent": f.get("intent", ""),
+                "target_function": f.get("target_function", ""),
+                "class": f.get("class", "isolated"),
             }
-            for f in isolated_deduped
+            for idx, f in enumerate(isolated_deduped, 1)
         ]
 
         compositor_input = f"""{readme}
@@ -193,59 +195,20 @@ class Inspector:
     def extract_json(self, raw_response: str) -> dict:
         """Extracts JSON from an LLM response string.
 
-        Handles markdown blocks and repairs truncated or malformed JSON payloads
-        defensively.
+        Delegates to domain.json_extract: string-aware fence/brace
+        extraction plus content-preserving truncation repair. Always
+        returns a dict — a bare JSON list is wrapped as the findings
+        array, and unparseable output degrades to an empty findings list
+        (callers treat empty-after-failed-parse as a parse failure, never
+        as a clean result).
         """
-        json_str = raw_response.strip()
-        if "```json" in json_str:
-            json_str = json_str.split("```json")[1].split("```")[0].strip()
-        elif "```" in json_str:
-            json_str = json_str.split("```")[1].split("```")[0].strip()
+        from domain.json_extract import extract_json_value
 
-        try:
-            return json.loads(json_str)
-        except json.JSONDecodeError:
-            print(
-                "      [WARNING] Malformed or truncated JSON detected. Executing auto-repair pass..."
-            )
-            return self._repair_truncated_json(json_str)
-
-    def _repair_truncated_json(self, json_str: str) -> dict:
-        """Defensively patches open quotes and balances trailing structural braces
-
-        for broken or truncated LLM JSON payloads.
-        """
-        json_str = json_str.strip()
-
-        # Issue 1: Fix unclosed strings/quotes
-        quotes = len(re.findall(r'(?<!\\)"', json_str))
-        if quotes % 2 != 0:
-            json_str += '"'
-
-        # Issue 2: Balance brackets and braces
-        open_braces = json_str.count("{")
-        close_braces = json_str.count("}")
-        open_brackets = json_str.count("[")
-        close_brackets = json_str.count("]")
-
-        if (
-            open_brackets > close_brackets
-            and not json_str.endswith("}")
-            and open_braces > close_braces
-        ):
-            json_str += "}"
-            close_braces += 1
-
-        if open_brackets > close_brackets:
-            json_str += "]" * (open_brackets - close_brackets)
-
-        if open_braces > close_braces:
-            json_str += "}" * (open_braces - close_braces)
-
-        try:
-            return json.loads(json_str)
-        except Exception as e:
-            print(
-                f"      [CRITICAL] Auto-repair failed. Returning empty findings list. Error: {e}"
-            )
-            return {"findings": []}
+        value, err = extract_json_value(raw_response)
+        if isinstance(value, list):
+            return {"findings": value}
+        if isinstance(value, dict):
+            return value
+        print(f"      [CRITICAL] No recoverable JSON in LLM output ({err}). "
+              f"Returning empty findings list.")
+        return {"findings": []}

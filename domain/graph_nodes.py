@@ -14,12 +14,34 @@ from domain.gatekeeper import FoundryGatekeeper
 from domain.fixer import FixerAgent
 from domain.formatter import SubmissionFormatter
 from domain.schema import build_finding
-from domain.llm_utils import EmptyResponseError, call_with_retry, guarded_invoke
+from domain.llm_utils import (EmptyResponseError, call_with_retry,
+                              content_to_text, guarded_invoke)
 from domain.semantics import compose_reachability_script
 from domain.z3_runner import run_z3
 import uuid
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_supervisor_decision(raw_content: str) -> dict:
+    """Parse the supervisor's routing JSON from raw LLM output.
+
+    Raises ValueError when no JSON object can be recovered (the caller
+    forces a heal cycle). Defends against list-wrapped and scalar JSON,
+    which previously crashed .get() or silently passed as approval."""
+    from domain.json_extract import extract_json_value
+
+    cleaned = re.sub(r'<think>.*?</think>', '', raw_content or "",
+                     flags=re.DOTALL).strip()
+    value, err = extract_json_value(cleaned)
+    if value is None:
+        raise ValueError(f"supervisor output had no JSON payload ({err})")
+    if isinstance(value, list):
+        value = value[0] if value else {}
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"Supervisor output is not a JSON object: {type(value).__name__}")
+    return value
 
 
 def supervisor_node(state: GraphState, llm_pro):
@@ -47,33 +69,24 @@ def supervisor_node(state: GraphState, llm_pro):
     ]
 
     response = call_with_retry(lambda: guarded_invoke(llm_pro, messages))
-    raw_content = response.content.strip()
-    
-    # Clean out any leaked <think> blocks
-    raw_content = re.sub(r'<think>.*?</think>', '', raw_content, flags=re.DOTALL).strip()
-    
-    if "```json" in raw_content:
-        raw_content = raw_content.split("```json")[1].split("```")[0].strip()
-    elif "```" in raw_content:
-        raw_content = raw_content.split("```")[1].split("```")[0].strip()
-        
+    raw_content = content_to_text(response.content).strip()
+
     try:
-        # strict=False prevents crashes from unescaped newlines
-        decision = json.loads(raw_content, strict=False)
-
-        # Defend against LLM hallucinating an array instead of an object
-        if isinstance(decision, list):
-            decision = decision[0] if len(decision) > 0 else {}
-
-        # Defend against scalar/string JSON (e.g. '"APPROVED"') crashing on
-        # .get() below — treat it as a parse failure and force a heal cycle.
-        if not isinstance(decision, dict):
-            raise ValueError(f"Supervisor output is not a JSON object: {type(decision).__name__}")
-
+        decision = _parse_supervisor_decision(raw_content)
         status = decision.get("status", "APPROVED").upper()
-        
+
+        critique = decision.get("supervisor_critique") if status == "REJECTED" else None
+        if status == "REJECTED" and not critique:
+            # A rejection with no feedback would re-enter the hunter with a
+            # None critique — indistinguishable from an approval. Force an
+            # explicit heal signal instead.
+            critique = ("Findings rejected but no critique was provided. "
+                        "Re-derive each finding strictly from the contract "
+                        "code and the CFG abstraction; drop anything you "
+                        "cannot ground in a specific code location.")
+
         return {
-            "supervisor_critique": decision.get("supervisor_critique") if status == "REJECTED" else None,
+            "supervisor_critique": critique,
             "supervisor_runs": state.get("supervisor_runs", 0) + 1,
             "messages": [AIMessage(content=f"[SUPERVISOR]: {decision.get('thought_process', 'Evaluation complete.')}")]
         }
@@ -100,7 +113,7 @@ def _parse_hunter_output(raw_response: str, inspector: Inspector):
     """
     findings = []
     parse_error = None
-    clean_response = re.sub(r'<think>.*?</think>', '', raw_response, flags=re.DOTALL).strip()
+    clean_response = re.sub(r'<think>.*?</think>', '', raw_response or "", flags=re.DOTALL).strip()
 
     # Early guard: the LLM sometimes returns only <think>...</think> tags
     # (reasoning trace with no JSON payload) or malformed markdown fences.
@@ -109,36 +122,26 @@ def _parse_hunter_output(raw_response: str, inspector: Inspector):
     if not clean_response:
         return [], "LLM response was empty after <think>-strip (reasoning-only output, no JSON payload)", True
 
-    try:
-        if "```json" in clean_response:
-            clean_response = clean_response.split("```json")[1].split("```")[0].strip()
-        elif "```" in clean_response:
-            clean_response = clean_response.split("```")[1].split("```")[0].strip()
+    from domain.json_extract import extract_json_value
 
-        if not clean_response:
-            return [], "LLM response contained only markdown fences with no JSON payload", True
+    value, err = extract_json_value(clean_response)
+    if value is None:
+        # Distinguish "provider gave us fences but no payload" (empty-ish
+        # response, short-circuit outer retries) from genuine garbage JSON
+        # (worth one bounded retry).
+        if "```" in clean_response:
+            parts = clean_response.split("```")
+            inner = "".join(b for i, b in enumerate(parts) if i % 2 == 1)
+            inner = re.sub(r"^[A-Za-z0-9_-]+[ \t]*\r?\n?", "", inner)
+            if not inner.strip():
+                return [], "LLM response contained only markdown fences with no JSON payload", True
+        logger.warning("[BUG HUNTER] No JSON payload recovered from Isolator output: %s", err)
+        return [], f"Could not extract a JSON payload from Isolator output ({err})", False
 
-        # strict=False fixes the "Invalid control character" error natively
-        parsed_data = json.loads(clean_response, strict=False)
-
-        if isinstance(parsed_data, dict):
-            findings = parsed_data.get("findings", [])
-        elif isinstance(parsed_data, list):
-            findings = parsed_data
-
-    except json.JSONDecodeError as e:
-        logger.warning("[BUG HUNTER] JSON Parse Error: %s. Falling back to Inspector extractor.", e)
-        try:
-            parsed_data = inspector.extract_json(raw_response)
-            findings = parsed_data.get("findings", [])
-            if not findings:
-                # A genuine empty findings array parses on the primary path,
-                # so empty-after-repair means the payload was garbage, not
-                # clean — never let it masquerade as a safe verdict.
-                parse_error = f"Primary JSON parse failed ({e}); fallback extractor recovered no findings."
-        except Exception as fallback_err:
-            findings = []
-            parse_error = f"Primary JSON parse failed ({e}); fallback extractor failed ({fallback_err})."
+    if isinstance(value, dict):
+        findings = value.get("findings", [])
+    elif isinstance(value, list):
+        findings = value
 
     if not isinstance(findings, list):
         findings = []
@@ -399,36 +402,24 @@ def specifier_node(state: GraphState, generator: PropertyGenerator):
             "messages": [AIMessage(content="[SPECIFIER]: Z3 Property Generated.")]
         }
 
-def _handle_unsat_verdict(state: GraphState, updates: dict) -> None:
-    """UNSAT verdict handling. When a deterministic semantic harness exists,
-    probe it for vacuity (an unreachable model makes UNSAT meaningless).
-    Harness-less scripts are covered by the mandatory SANITY sentinel probe
-    enforced in z3_runner, so a plain UNSAT there is trusted."""
+def _probe_harness_vacuity(state: GraphState) -> str | None:
+    """Vacuity probe for UNSAT verdicts. When a deterministic semantic
+    harness exists, check that the model itself is satisfiable — an
+    unreachable model makes any UNSAT meaningless. Returns the vacuity
+    reason string, or None when the UNSAT is trustworthy (probe sat, or
+    no harness: harness-less scripts are covered by the mandatory SANITY
+    sentinel probe enforced in z3_runner)."""
     harness = _active_harness(state)
-    if harness and harness.get("code"):
-        vac_script = compose_reachability_script(harness)
-        vac_result = run_z3(vac_script)
-        if vac_result.get("status") == "sat":
-            # Model satisfiable without property -> genuine proof
-            updates["messages"] = [AIMessage(content="[EXECUTOR]: UNSAT. Property holds safely.")]
-        elif vac_result.get("status") in ("unsat", "error", "inconclusive"):
-            # Model itself is unsatisfiable or could not be checked ->
-            # the UNSAT property result may be vacuous
-            reason = (
-                "harness model is unsatisfiable (guards contradict bounds "
-                "or transitions) — property holds vacuously, NOT a real proof"
-                if vac_result.get("status") == "unsat"
-                else f"vacuity probe inconclusive ({vac_result.get('error', 'unknown')})"
-            )
-            updates["vacuity_status"] = "vacuous"
-            updates["vacuity_reason"] = reason
-            print(f"      [VACUITY] {state.get('current_focus_function')}: {reason}")
-            updates["messages"] = [AIMessage(
-                content=f"[EXECUTOR]: UNSAT but VACUOUS — {reason}")]
-        else:
-            updates["messages"] = [AIMessage(content="[EXECUTOR]: UNSAT. Property holds safely.")]
-    else:
-        updates["messages"] = [AIMessage(content="[EXECUTOR]: UNSAT. Property holds safely.")]
+    if not (harness and harness.get("code")):
+        return None
+    vac_script = compose_reachability_script(harness)
+    vac_result = run_z3(vac_script)
+    if vac_result.get("status") == "sat":
+        return None
+    if vac_result.get("status") == "unsat":
+        return ("harness model is unsatisfiable (guards contradict bounds "
+                "or transitions) — property holds vacuously, NOT a real proof")
+    return f"vacuity probe inconclusive ({vac_result.get('error', 'unknown')})"
 
 
 def executor_node(state: GraphState, cegis_tool: CEGIS):
@@ -459,16 +450,43 @@ def executor_node(state: GraphState, cegis_tool: CEGIS):
             cex_txt = "\nConcrete counterexample assignments: " + ", ".join(
                 f"{k}={v}" for k, v in sorted(cex["assignments"].items()))
         updates["bug_report"] = f"[Z3] Counterexample found:\n{result['output']}{cex_txt}"
+        # Successful verdict: any leftover critique (e.g. an earlier Z3 error)
+        # is stale — clear it so it cannot leak into the next specifier prompt
+        # or detour routing through the supervisor.
+        updates["supervisor_critique"] = None
         updates["messages"] = [AIMessage(content="[EXECUTOR]: SAT. Counterexample found. Passing to Gatekeeper.")]
     elif result["status"] == "unsat":
-        remaining = state.get("findings", []) or []
-        updates["findings"] = remaining[1:] if remaining else []
-        if updates["findings"]:
-            # Queue advanced to the next finding — give it a fresh executor
-            # budget. Without this, the first finding can burn
-            # EXECUTOR_MAX_ITERATIONS and starve every queued sibling.
-            updates["executor_runs"] = 0
-        _handle_unsat_verdict(state, updates)
+        vacuity_reason = _probe_harness_vacuity(state)
+        if vacuity_reason:
+            # Vacuous UNSAT: the base model itself is unreachable, so nothing
+            # was proven. Previously the finding was consumed here anyway —
+            # it vanished with no regeneration chance and no per-finding
+            # artifact when another bug had already been verified. Treat it
+            # exactly like a SANITY-vacuous verdict: keep the finding queued
+            # and feed repair guidance to the specifier (bounded by
+            # EXECUTOR_MAX_ITERATIONS, which then surfaces the incomplete
+            # artifact honestly).
+            updates["vacuity_status"] = "vacuous"
+            updates["vacuity_reason"] = vacuity_reason
+            updates["supervisor_critique"] = (
+                "Z3 VACUOUS MODEL: " + vacuity_reason
+                + " Re-derive each state precondition from the contract code, "
+                "ensure the base model alone is satisfiable, and regenerate "
+                "the property."
+            )
+            print(f"      [VACUITY] {state.get('current_focus_function')}: {vacuity_reason}")
+            updates["messages"] = [AIMessage(
+                content=f"[EXECUTOR]: UNSAT but VACUOUS — {vacuity_reason}. Finding kept queued.")]
+        else:
+            remaining = state.get("findings", []) or []
+            updates["findings"] = remaining[1:] if remaining else []
+            if updates["findings"]:
+                # Queue advanced to the next finding — give it a fresh executor
+                # budget. Without this, the first finding can burn
+                # EXECUTOR_MAX_ITERATIONS and starve every queued sibling.
+                updates["executor_runs"] = 0
+            updates["supervisor_critique"] = None
+            updates["messages"] = [AIMessage(content="[EXECUTOR]: UNSAT. Property holds safely.")]
     elif result["status"] == "vacuous":
         # SANITY probe failed: the base model is over-constrained, so every
         # check was vacuously UNSAT. Keep the finding queued and feed explicit
@@ -505,6 +523,7 @@ def gatekeeper_node(state: GraphState, gatekeeper: FoundryGatekeeper):
         return {
             "findings": remaining_findings[1:],
             "executor_runs": 0,
+            "supervisor_critique": None,
             "messages": [AIMessage(content="[GATEKEEPER]: Finding out of scope. Dropped.")]
         }
         
@@ -576,12 +595,14 @@ def _gatekeeper_verify(state, gatekeeper, finding, remaining_findings,
             "verified_bugs": current_bugs + [new_bug],
             "findings": remaining_findings[1:],
             "executor_runs": 0,
+            "supervisor_critique": None,
             "messages": [AIMessage(content="[GATEKEEPER]: Bug CONFIRMED in EVM execution.")]
         }
     elif qc_status == "property_held":
         return {
             "findings": remaining_findings[1:],
             "executor_runs": 0,
+            "supervisor_critique": None,
             "messages": [AIMessage(content="[GATEKEEPER]: FALSE POSITIVE. Property held during EVM execution. Dropping finding.")]
         }
     else:
@@ -599,6 +620,7 @@ def _gatekeeper_verify(state, gatekeeper, finding, remaining_findings,
             "verified_bugs": current_bugs + [new_bug],
             "findings": remaining_findings[1:],
             "executor_runs": 0,
+            "supervisor_critique": None,
             "messages": [AIMessage(content=f"[GATEKEEPER]: Execution failed ({qc_status}). Pushing Z3-proven bug to manual review.")]
         }
 

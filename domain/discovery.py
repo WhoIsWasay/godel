@@ -20,7 +20,6 @@ Output buckets:
 
 Deterministic except step 1. Default model: fast/cheap (GODEL_DISCOVERY_MODEL).
 """
-import json
 import logging
 import os
 import re
@@ -28,7 +27,7 @@ import re
 from domain.invariants import (check_invariant_preservation,
                                _referenced_keys, InvariantSyntaxError)
 from domain.semantics import generate_harness
-from domain.llm_utils import call_with_retry, guarded_invoke
+from domain.llm_utils import call_with_retry, content_to_text, guarded_invoke
 
 logger = logging.getLogger(__name__)
 
@@ -103,20 +102,14 @@ OUTPUT: JSON only, shape {{"invariants": ["expr1", "expr2"]}}"""
 
 
 def _extract_json(raw: str) -> dict:
-    s = (raw or "").strip()
-    if "```json" in s:
-        s = s.split("```json")[1].split("```")[0]
-    elif "```" in s:
-        s = s.split("```")[1].split("```")[0]
-    try:
-        return json.loads(s.strip())
-    except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", s, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except json.JSONDecodeError:
-                pass
+    from domain.json_extract import extract_json_value
+    value, err = extract_json_value(raw or "")
+    if isinstance(value, dict):
+        return value
+    if value is not None:
+        logger.warning("[DISCOVERY] non-object JSON payload: %r", type(value).__name__)
+    elif (raw or "").strip():
+        logger.warning("[DISCOVERY] could not extract JSON from proposer output: %s", err)
     return {}
 
 
@@ -137,7 +130,7 @@ def propose_invariants(analysis: dict, llm, max_invariants: int = 6) -> tuple[li
     try:
         resp = call_with_retry(lambda: guarded_invoke(llm, [
             ("system", prompt), ("user", user)]))
-        content = resp.content if hasattr(resp, "content") else str(resp)
+        content = content_to_text(getattr(resp, "content", None)) or str(resp)
     except Exception as e:
         logger.warning("[DISCOVERY] proposer LLM failed (non-fatal): %s", e)
         return [], [("all", f"llm error: {e}")]

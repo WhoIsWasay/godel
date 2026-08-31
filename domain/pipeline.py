@@ -588,9 +588,17 @@ def route_after_specifier(state: GraphState) -> str:
     # A critique left over from an Executor Z3 error is repair feedback for the
     # specifier itself — do NOT detour through the supervisor (that would burn
     # SUPERVISOR_MAX_ITERATIONS slots and can restart the whole hunter loop).
+    # Executor repair feedback is recognized by its Z3 prefix: it must reach
+    # the executor even when the last z3_result status is a verdict like
+    # "unsat" (the vacuous-UNSAT path sets a Z3 VACUOUS MODEL critique after
+    # an unsat run).
     res = state.get("z3_result", {}) or {}
     last_status = res.get("status")
-    if state.get("supervisor_critique") and last_status not in ("error", "inconclusive", "vacuous"):
+    critique = state.get("supervisor_critique")
+    is_executor_feedback = isinstance(critique, str) and critique.startswith(
+        ("Z3 VACUOUS MODEL", "Z3 Syntax/Execution Error"))
+    if critique and not is_executor_feedback \
+            and last_status not in ("error", "inconclusive", "vacuous"):
         return "supervisor"
     return "executor"
 
@@ -928,6 +936,8 @@ def _run_compositor_phase(stem: str, results: list, raw_contract: str,
     a Compositor failure must never sink per-function verdicts."""
     all_findings = []
     for r in results:
+        if not isinstance(r, dict):
+            continue
         finding = r.get("finding") if isinstance(r.get("finding"), dict) else r
         if finding.get("intent") and finding.get("target_function"):
             all_findings.append(finding)
@@ -979,7 +989,16 @@ def _run_compositor_phase(stem: str, results: list, raw_contract: str,
         logger.warning("[COMPOSITOR] JSON parse failed for %s (non-fatal): %s", stem, e)
         return []
 
+    if not isinstance(compositor_data, dict):
+        logger.warning("[COMPOSITOR] Non-object JSON payload for %s (non-fatal): %r",
+                       stem, type(compositor_data).__name__)
+        return []
+
     comp_findings = compositor_data.get("findings", [])
+    if not isinstance(comp_findings, list):
+        logger.warning("[COMPOSITOR] 'findings' is not a list for %s (non-fatal)", stem)
+        return []
+    comp_findings = [cf for cf in comp_findings if isinstance(cf, dict)]
     if not comp_findings:
         print(f"  [COMPOSITOR] No cross-function chains discovered")
         return []
@@ -1199,6 +1218,12 @@ def run_pipeline(contract_folder: str = None) -> list:
                       f"(no state writes / no external calls): {', '.join(skipped)}")
             functions = kept
 
+        # Findings from PREVIOUS files already sit in `results`; record the
+        # offset so the compositor phase below only sees THIS file's findings
+        # (cross-file contamination once fed other contracts' findings into
+        # this contract's chain analysis).
+        file_result_start = len(results)
+
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=config.MAX_WORKERS)
         future_to_func = {
             executor.submit(process_function, func, raw_solidity_code, stem, readme,
@@ -1289,21 +1314,23 @@ def run_pipeline(contract_folder: str = None) -> list:
         # which thinks like a malicious MEV searcher to find multi-hop exploit
         # chains. Non-fatal — a Compositor failure never sinks per-function
         # verdicts. One LLM call per contract.
-        if not config.is_dry_run() and results:
-            try:
-                comp_results = _run_compositor_phase(
-                    stem, results, raw_solidity_code, readme, inspector,
-                    static_analysis=static_analysis, app=app,
-                )
-                if comp_results:
-                    results.extend(comp_results)
-                    print(f"  [COMPOSITOR] {len(comp_results)} compositional "
-                          f"finding(s) merged into results")
-            except Exception as exc:
-                logger.error("[COMPOSITOR] phase failed for %s (non-fatal): %s",
-                             stem, exc)
-                print(f"  [COMPOSITOR] {stem}: phase failed — non-fatal "
-                      f"({type(exc).__name__}: {str(exc)[:200]})")
+        if not config.is_dry_run():
+            file_results = results[file_result_start:]
+            if file_results:
+                try:
+                    comp_results = _run_compositor_phase(
+                        stem, file_results, raw_solidity_code, readme, inspector,
+                        static_analysis=static_analysis, app=app,
+                    )
+                    if comp_results:
+                        results.extend(comp_results)
+                        print(f"  [COMPOSITOR] {len(comp_results)} compositional "
+                              f"finding(s) merged into results")
+                except Exception as exc:
+                    logger.error("[COMPOSITOR] phase failed for %s (non-fatal): %s",
+                                 stem, exc)
+                    print(f"  [COMPOSITOR] {stem}: phase failed — non-fatal "
+                          f"({type(exc).__name__}: {str(exc)[:200]})")
 
         # Phase C (compositional): contract-wide invariant discovery. Runs
         # AFTER the per-function graphs so its findings merge into the same

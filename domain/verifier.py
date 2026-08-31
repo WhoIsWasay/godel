@@ -2,7 +2,8 @@ import os
 from langchain_core.messages import SystemMessage, HumanMessage
 from domain.config import PROMPTS_DIR
 from domain.extractor import OutputExtractor
-from domain.llm_utils import call_with_retry, guarded_invoke
+from domain.llm_utils import call_with_retry, content_to_text, guarded_invoke
+from domain.json_extract import fenced_blocks
 from domain.solc_compat import needs_legacy_harness, legacy_generation_directive, LEGACY_HEAL_HINT
 
 
@@ -132,7 +133,7 @@ Read the contract source inside <contract> tags, parse its true interface bounds
                 HumanMessage(content=user_content),
             ])
         )
-        return self._clean_markdown(response.content.strip())
+        return self._clean_markdown(content_to_text(response.content))
 
 
     def heal_test_suite(self, broken_code: str, error_log: str, legacy: bool = False) -> str:
@@ -149,11 +150,15 @@ COMPILER ERROR:
 {legacy_reminder}
 Review the original target contract interface, correct the syntax/arguments according to the exact error, and return ONLY the corrected raw Solidity code inside markdown fences."""
         response = call_with_retry(lambda: guarded_invoke(self.heal_llm, feedback_prompt))
-        return self._clean_markdown(response.content.strip())
+        return self._clean_markdown(content_to_text(response.content))
 
     def _clean_markdown(self, content: str) -> str:
-        if "```solidity" in content:
-            return content.split("```solidity")[1].split("```")[0].strip()
-        elif "```" in content:
-            return content.split("```")[1].split("```")[0].strip()
-        return content
+        blocks = fenced_blocks(content)
+        if blocks:
+            # Prefer the block that actually looks like Solidity (the model
+            # sometimes fences scratchpad prose too); fall back to the last.
+            for b in reversed(blocks):
+                if "pragma solidity" in b or "contract " in b or "import " in b:
+                    return b.strip()
+            return blocks[-1].strip()
+        return content.strip()

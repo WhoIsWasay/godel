@@ -2,7 +2,7 @@ import json
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from domain.config import PROMPTS_DIR
-from domain.llm_utils import call_with_retry, guarded_invoke
+from domain.llm_utils import call_with_retry, content_to_text, guarded_invoke
 
 
 class PropertyGenerator:
@@ -33,7 +33,7 @@ class PropertyGenerator:
                 HumanMessage(content=self.prompt),
             ])
         )
-        raw = response.content
+        raw = content_to_text(response.content)
 
         if "```python" in raw:
             code = raw.split("```python")[1].split("```")[0].strip()

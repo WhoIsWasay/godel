@@ -4,7 +4,7 @@ import logging
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_openai import ChatOpenAI
 
-from domain.llm_utils import call_with_retry, guarded_invoke
+from domain.llm_utils import call_with_retry, content_to_text, guarded_invoke
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,7 @@ Output the corrected `{target_function_name}` function body only, inside ```soli
                     HumanMessage(content=user_payload),
                 ])
             )
-            return self._extract_clean_solidity(response.content)
+            return self._extract_clean_solidity(content_to_text(response.content))
         except Exception as e:
             return f"// Error executing Fixer Agent logic for function {target_function_name}: {str(e)}"
 

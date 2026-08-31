@@ -13,7 +13,7 @@ class OutputExtractor:
             return extracted_variables
 
         # Require a definitive assignment operator (= or ->) flanked by the variable and value
-        pattern = r"([a-zA-Z0-9_]+)\s*(?:=Updated|=>|=Position|=|-?\>)\s*([a-zA-Z0-9_x]+)"
+        pattern = r"([a-zA-Z0-9_]+)\s*(?:=Updated|=>|=Position|=|-?\>)\s*(-?[a-zA-Z0-9_x]+)"
         matches = re.findall(pattern, z3_output)
 
         # Filter out known log words to avoid noise
@@ -23,8 +23,8 @@ class OutputExtractor:
             if var_name in banned_keys:
                 continue
             
-            # Clean up numeric values if they are digits
-            if value.isdigit():
+            # Clean up numeric values if they are digits (sign included)
+            if value.lstrip("-").isdigit():
                 extracted_variables[var_name] = int(value)
             elif value.startswith("0x"):
                 extracted_variables[var_name] = value

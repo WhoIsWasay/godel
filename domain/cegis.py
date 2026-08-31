@@ -20,7 +20,7 @@ import re
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from domain import config
-from domain.llm_utils import call_with_retry, guarded_invoke
+from domain.llm_utils import call_with_retry, content_to_text, guarded_invoke
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +82,7 @@ Return ONLY the corrected full Python code block."""
             logger.error("[CEGIS] repair invoke failed: %s", e)
             return None
 
-        raw = response.content.strip()
+        raw = content_to_text(response.content).strip()
         raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
         if "```python" in raw:
             return raw.split("```python")[1].split("```")[0].strip()
