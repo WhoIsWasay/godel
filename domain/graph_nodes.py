@@ -192,6 +192,22 @@ def bug_hunter_node(state: GraphState, inspector: Inspector):
     except Exception as e:
         logger.warning("compositional context generation failed (non-fatal): %s", e)
 
+    # --- Attack-chain context: cross-boundary multi-step attacks ---
+    # Distinct from compositional_context: flags chains where the attacker's
+    # final exploit step happens OUTSIDE the contract (e.g., transferFrom
+    # after an approve), which per-function analysis cannot prove.
+    attack_chain_context = ""
+    try:
+        from domain.attack_chains import render_attack_chain_context
+        static_analysis_for_chains = state.get("slither_result")
+        if static_analysis_for_chains:
+            attack_chain_context = render_attack_chain_context(
+                static_analysis_for_chains, focus_func)
+            if attack_chain_context:
+                logger.info("[BUG HUNTER] Attack-chain context injected for %s", focus_func)
+    except Exception as e:
+        logger.warning("attack-chain context generation failed (non-fatal): %s", e)
+
     # --- Wrap probe signals: BitVec-256 overflow/underflow reachability ---
     wrap_context = ""
     wrap_signals = state.get("wrap_probe_signals")
@@ -231,6 +247,7 @@ A <cfg_abstraction> block may be present inside the isolation packet. It is DETE
 - If the block is absent or truncated, proceed from source only — do not invent CFG facts.
 
 {compositional_context}
+{attack_chain_context}
 {wrap_context}
 {paired_cfg_context}
 === SYSTEM README ===
