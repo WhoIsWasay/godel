@@ -606,7 +606,21 @@ def route_after_specifier(state: GraphState) -> str:
 def route_after_executor(state: GraphState) -> str:
     res = state.get("z3_result", {}) or {}
     status = res.get("status")
-    if status in ("error", "inconclusive", "vacuous"):
+    # A vacuous UNSAT reads status="unsat" but is NOT a verdict — the vacuity
+    # probe found the base model over-constrained, so nothing was proven. The
+    # executor keeps that finding queued for regeneration and never consumes
+    # it, so the fallback below would re-queue the SAME finding forever with no
+    # cap. Treat it exactly like the SANITY-vacuous case: bound it by
+    # executor_runs so the loop terminates and the incomplete artifact surfaces.
+    vacuous_unsat = status == "unsat" and state.get("vacuity_status") == "vacuous"
+    if vacuous_unsat and state.get("vacuity_unfixable"):
+        # The DETERMINISTIC harness is self-contradictory. The vacuity probe
+        # runs on the machine model alone (independent of the AI property), so
+        # it returns the same unsat every round — regenerating the property via
+        # the specifier can never fix it and just burns an LLM call per round.
+        # End now; the incomplete artifact reports it honestly.
+        return END
+    if status in ("error", "inconclusive", "vacuous") or vacuous_unsat:
         # inconclusive = script ran but printed no unambiguous verdict sentinel;
         # vacuous = SANITY probe failed (over-constrained base model). Neither
         # is a verdict — all need a regenerated/refined property.

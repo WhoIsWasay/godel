@@ -348,6 +348,24 @@ class TestExecutorCritiqueAndVacuity:
         assert "findings" not in updates
         assert updates["vacuity_status"] == "vacuous"
         assert updates["supervisor_critique"].startswith("Z3 VACUOUS MODEL")
+        # A contradictory DETERMINISTIC harness cannot be fixed by rewriting the
+        # property -> flagged so the router ends without re-calling the LLM.
+        assert updates["vacuity_unfixable"] is True
+
+    def test_inconclusive_vacuity_stays_fixable(self, monkeypatch):
+        import domain.graph_nodes as gn
+        from domain.graph_nodes import executor_node
+        monkeypatch.setattr(gn, "_probe_harness_vacuity",
+                            lambda state: "vacuity probe inconclusive (timeout)")
+        state = {
+            "z3_code": "from z3 import *",
+            "iterations": 0, "executor_runs": 0,
+            "findings": [{"id": 1, "intent": "x"}],
+        }
+        updates = executor_node(state, _FakeCEGIS({"status": "unsat", "output": "holds"}))
+        assert updates["vacuity_status"] == "vacuous"
+        # Not a proven harness contradiction -> keep the bounded repair path.
+        assert updates["vacuity_unfixable"] is False
 
 
 class TestProbeHarnessVacuity:

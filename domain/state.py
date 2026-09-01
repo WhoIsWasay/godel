@@ -91,6 +91,12 @@ class GraphState(TypedDict):
     # transitions contradict guards). A vacuous UNSAT means nothing was proven.
     vacuity_status: Optional[str]
     vacuity_reason: Optional[str]
+    # True when the vacuity originates in the DETERMINISTIC harness itself
+    # (guards contradict bounds/transitions). compose_reachability_script probes
+    # the machine model alone, independent of the AI-written property, so it
+    # returns the same unsat every iteration — no specifier rewrite can fix it.
+    # The router ends immediately instead of burning an LLM call per round.
+    vacuity_unfixable: Optional[bool]
     
     
     poc_test_code : str

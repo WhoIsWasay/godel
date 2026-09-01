@@ -450,6 +450,15 @@ def executor_node(state: GraphState, cegis_tool: CEGIS):
         "z3_result": result,
         "iterations": state.get("iterations", 0) + 1,
         "executor_runs": state.get("executor_runs", 0) + 1,
+        # Reset per-run so vacuity_status reflects ONLY the current execution.
+        # Without this it is sticky: a later clean unsat/sat for a different
+        # queued finding would still carry a stale "vacuous" flag, mislabeling
+        # the terminal artifact and misrouting now that the router bounds on it.
+        # The vacuous branch below overrides these back to "vacuous" when the
+        # current run is vacuous.
+        "vacuity_status": None,
+        "vacuity_reason": None,
+        "vacuity_unfixable": False,
     }
 
     if result["status"] == "sat":
@@ -468,15 +477,23 @@ def executor_node(state: GraphState, cegis_tool: CEGIS):
         vacuity_reason = _probe_harness_vacuity(state)
         if vacuity_reason:
             # Vacuous UNSAT: the base model itself is unreachable, so nothing
-            # was proven. Previously the finding was consumed here anyway —
-            # it vanished with no regeneration chance and no per-finding
-            # artifact when another bug had already been verified. Treat it
-            # exactly like a SANITY-vacuous verdict: keep the finding queued
-            # and feed repair guidance to the specifier (bounded by
-            # EXECUTOR_MAX_ITERATIONS, which then surfaces the incomplete
-            # artifact honestly).
+            # was proven. Keep the finding queued (never silently consume it)
+            # and surface the incomplete artifact honestly.
+            #
+            # Two sub-cases:
+            #  - The DETERMINISTIC harness is self-contradictory ("harness model
+            #    is unsatisfiable"). compose_reachability_script probes the
+            #    machine model alone, independent of the AI-written property, so
+            #    it returns the SAME unsat every iteration. No specifier rewrite
+            #    can fix it — flag vacuity_unfixable so the router ends at once
+            #    instead of burning one LLM call per round (this is what spun
+            #    withdraw to Iteration 88+ in CI).
+            #  - Anything else (e.g. an inconclusive probe) stays on the bounded
+            #    repair path via EXECUTOR_MAX_ITERATIONS.
             updates["vacuity_status"] = "vacuous"
             updates["vacuity_reason"] = vacuity_reason
+            updates["vacuity_unfixable"] = vacuity_reason.startswith(
+                "harness model is unsatisfiable")
             updates["supervisor_critique"] = (
                 "Z3 VACUOUS MODEL: " + vacuity_reason
                 + " Re-derive each state precondition from the contract code, "

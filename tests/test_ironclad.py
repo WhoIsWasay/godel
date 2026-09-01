@@ -278,6 +278,27 @@ def test_executor_unsat_pops_finding():
     assert updates["findings"] == [{"id": 2}]
 
 
+def test_executor_clears_stale_vacuity_on_clean_unsat(monkeypatch):
+    # A prior iteration left vacuity_status="vacuous". The current run is a
+    # clean, non-vacuous UNSAT — the stale flag must be reset to None so it
+    # cannot mislabel the terminal artifact or misroute the bounded loop.
+    import domain.graph_nodes as gn
+    monkeypatch.setattr(gn, "_probe_harness_vacuity", lambda state: None)
+    state = {
+        "z3_code": "from z3 import *",
+        "iterations": 1,
+        "executor_runs": 1,
+        "findings": [{"id": 1}, {"id": 2}],
+        "semantic_harness": None,
+        "vacuity_status": "vacuous",
+        "vacuity_reason": "stale reason from prior iteration",
+    }
+    fake = _FakeCEGIS({"status": "unsat", "output": "Property holds"})
+    updates = gn.executor_node(state, fake)
+    assert updates["vacuity_status"] is None
+    assert updates["vacuity_reason"] is None
+
+
 # ----------------------------------------------------- 8. routing decisions
 
 def test_route_after_executor_matrix():
@@ -298,6 +319,25 @@ def test_route_after_executor_matrix():
     assert route_after_executor({"z3_result": {"status": "unsat"}, "findings": [{"id": 2}]}) == "specifier"
     # unsat with no findings -> END
     assert route_after_executor({"z3_result": {"status": "unsat"}, "findings": []}) == END
+    # Regression: vacuous UNSAT (status "unsat" but vacuity_status "vacuous")
+    # keeps the finding queued. Below the cap it refines; at the cap it MUST
+    # terminate even with findings still queued (was an infinite loop: the
+    # withdraw CI run spun to Iteration 88+ through every timeout guard).
+    assert route_after_executor({
+        "z3_result": {"status": "unsat"}, "vacuity_status": "vacuous",
+        "findings": [{"id": 1}], "executor_runs": 0,
+    }) == "specifier"
+    assert route_after_executor({
+        "z3_result": {"status": "unsat"}, "vacuity_status": "vacuous",
+        "findings": [{"id": 1}], "executor_runs": config.EXECUTOR_MAX_ITERATIONS,
+    }) == END
+    # Unfixable deterministic-harness vacuity -> END immediately, below the cap
+    # and with findings queued: rewriting the property cannot fix a contradictory
+    # machine model, so we must not spend another specifier LLM call.
+    assert route_after_executor({
+        "z3_result": {"status": "unsat"}, "vacuity_status": "vacuous",
+        "vacuity_unfixable": True, "findings": [{"id": 1}], "executor_runs": 0,
+    }) == END
 
 
 def test_route_after_specifier_keeps_vacuous_feedback_off_supervisor():
