@@ -70,10 +70,15 @@ class SubmissionFormatter:
         qc = qc or {}
         qc_status = qc.get("qc_status") or ""
         verified = (qc_status == "confirmed")
+        forced = (qc_status == "confirmed_forced")
         severity_label = finding.get("severity_guess", "medium").upper()
         if qc_status and not verified:
-            severity_label = "INFORMATIONAL (UNVERIFIED)"
-            title_summary = "[UNVERIFIED] " + title_summary
+            if forced:
+                severity_label = "INFORMATIONAL (FORCED-STATE — REACHABILITY UNPROVEN)"
+                title_summary = "[FORCED-STATE] " + title_summary
+            else:
+                severity_label = "INFORMATIONAL (UNVERIFIED)"
+                title_summary = "[UNVERIFIED] " + title_summary
 
         # Interpolate variables safely into the string layout without formatting escapes
         compiled_markdown = self.template.format(
@@ -92,6 +97,15 @@ class SubmissionFormatter:
             lines = ["\n### VERIFICATION STATUS\n"]
             if verified:
                 lines.append(f"- EVM verification: **CONFIRMED** (qc_status={qc_status}).")
+            elif forced:
+                lines.append(
+                    f"- EVM verification: **REPRODUCED FROM A FORCED STATE** (qc_status={qc_status}). "
+                    "The invariant DID break in the EVM — but only after the PoC constructed the "
+                    "counterexample storage directly (`vm.store`/`vm.etch`). That proves the math is "
+                    "violable FROM that state; it does NOT prove the state is reachable through real "
+                    "public calls (it may be a spurious Z3 over-approximation). Treat as a hardening "
+                    "lead requiring manual reachability review, NOT a confirmed exploit."
+                )
             else:
                 lines.append(
                     f"- EVM verification: **NOT REPRODUCED** (qc_status={qc_status}). "

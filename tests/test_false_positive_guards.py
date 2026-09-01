@@ -31,6 +31,7 @@ from domain import z3_runner
 from domain.schema import build_finding, detect_forced_state, extract_qc_reason
 from domain.formatter import SubmissionFormatter
 from domain.inspector import Inspector
+from domain.gatekeeper import FoundryGatekeeper, downgrade_forced_confirmation
 
 
 # ===========================================================================
@@ -482,3 +483,152 @@ class TestDedupSameRootCause:
         b = _twin("the penalty subtraction underflows the vault assets total")
         out = _inspector().deduplicate([a, b])
         assert len(out) == 1
+
+
+# ===========================================================================
+# F. GATEKEEPER — a forced-state repro is NOT a sound confirmation
+# ===========================================================================
+# The concrete forge layer only filters false positives when the PoC REACHES the
+# vulnerable state through real public calls. If it force-constructs storage via
+# vm.store/vm.etch, a FAIL just re-demonstrates the state Z3 ASSUMED (which may
+# be a spurious over-approximation), so it must never graduate to "confirmed".
+FORCED_POC = """contract PropertyTest is Test {
+    function setUp() public {
+        vault = new MiniVault(address(token));
+        vm.store(address(vault), bytes32(uint256(0)), bytes32(uint256(2)));
+        vm.store(address(vault), bytes32(uint256(1)), bytes32(uint256(0)));
+    }
+    function invariant_property_verification() public {
+        vault.deposit(1);
+    }
+}"""
+
+REACHED_POC = """contract PropertyTest is Test {
+    function setUp() public {
+        vault = new MiniVault(address(token));
+        token.mint(address(this), 1000e18);
+    }
+    function invariant_property_verification() public {
+        vault.deposit(500);
+        vault.emergencyWithdrawAll();
+        vault.withdraw(1);
+    }
+}"""
+
+
+class TestDowngradeForcedConfirmation:
+    def test_forced_store_downgrades(self):
+        assert downgrade_forced_confirmation("confirmed", FORCED_POC) == "confirmed_forced"
+
+    def test_forced_etch_downgrades(self):
+        assert downgrade_forced_confirmation(
+            "confirmed", "vm.etch(target, code);") == "confirmed_forced"
+
+    def test_reached_state_stays_confirmed(self):
+        # A PoC that drives the contract through real calls is a SOUND confirm.
+        assert downgrade_forced_confirmation("confirmed", REACHED_POC) == "confirmed"
+
+    def test_empty_test_stays_confirmed(self):
+        assert downgrade_forced_confirmation("confirmed", "") == "confirmed"
+
+    def test_non_confirmed_verdicts_untouched(self):
+        for verdict in ("property_held", "harness_error", "inconclusive",
+                        "compile_failed", "timeout"):
+            assert downgrade_forced_confirmation(verdict, FORCED_POC) == verdict
+
+
+class TestGatekeeperForcedStateEndToEnd:
+    """Dry integration: monkeypatch subprocess.run so no toolchain is needed,
+    then assert the verdict that actually exits execute_qc_validation."""
+
+    def _run(self, tmp_path, monkeypatch, test_code):
+        class _Proc:
+            returncode = 1
+            stdout = "Ran 1 tests: FAIL. Assertion violated."
+            stderr = ""
+
+        monkeypatch.setattr("domain.gatekeeper.subprocess.run",
+                            lambda *a, **k: _Proc())
+        gk = FoundryGatekeeper(project_root=str(tmp_path), verifier_agent=None,
+                               debug_dir=str(tmp_path / "dbg"))
+        status, _ = gk.execute_qc_validation(
+            test_code, max_retries=1, debug_tag="fp_guard")
+        return status
+
+    def test_forced_state_poc_is_not_confirmed(self, tmp_path, monkeypatch):
+        assert self._run(tmp_path, monkeypatch, FORCED_POC) == "confirmed_forced"
+
+    def test_reached_state_poc_is_confirmed(self, tmp_path, monkeypatch):
+        assert self._run(tmp_path, monkeypatch, REACHED_POC) == "confirmed"
+
+
+class TestForcedStateLabeling:
+    def test_build_finding_forced_state(self):
+        f = build_finding(_finding("high"), _state(), "fixed",
+                          FORCED_POC, '{"reason": "div by zero"}',
+                          "confirmed_forced")
+        assert f["severity"] == "informational"
+        assert f["title"].startswith("[FORCED-STATE]")
+        assert f["metadata"]["verified"] is False
+        assert f["metadata"]["reachability_proven"] is False
+        assert f["metadata"]["poc_forces_state"] is True
+
+    def test_clean_confirmed_is_reachability_proven(self):
+        f = build_finding(_finding("high"), _state(), "fixed",
+                          REACHED_POC, "", "confirmed")
+        assert f["severity"] == "high"
+        assert f["metadata"]["verified"] is True
+        assert f["metadata"]["reachability_proven"] is True
+        assert f["metadata"]["poc_forces_state"] is False
+
+    def test_formatter_forced_state_wording(self):
+        md = _report({"qc_status": "confirmed_forced",
+                      "poc_test_code": FORCED_POC, "forge_output": ""})
+        assert "REPRODUCED FROM A FORCED STATE" in md
+        assert "[FORCED-STATE]" in md
+        assert "INFORMATIONAL (FORCED-STATE" in md
+        assert "reachability" in md.lower()
+        # must NOT read as a clean confirmation or a total non-repro
+        assert "**CONFIRMED**" not in md
+        assert "NOT REPRODUCED" not in md
+
+
+# ===========================================================================
+# G. SOUNDNESS SWEEP — only a clean "confirmed" may claim to be verified
+# ===========================================================================
+# The property the whole guard set exists to enforce: for EVERY verdict the
+# pipeline can emit except a clean "confirmed", the shipped finding must be
+# verified=False, reachability_proven=False, and capped to informational. A
+# false positive therefore can never masquerade as a confirmed vulnerability.
+NON_CONFIRMED_STATUSES = [
+    "confirmed_forced", "property_held", "harness_error", "inconclusive",
+    "compile_failed", "timeout", "tool_error", "tool_missing",
+    "graph_error", "analysis_incomplete", "",
+]
+
+
+class TestSoundnessSweep:
+    def test_only_clean_confirmed_is_verified(self):
+        f = build_finding(_finding("critical"), _state(), "fixed",
+                          REACHED_POC, "", "confirmed")
+        assert f["metadata"]["verified"] is True
+        assert f["metadata"]["reachability_proven"] is True
+        assert f["severity"] == "critical"
+        assert not f["title"].startswith(("[UNVERIFIED]", "[FORCED-STATE]"))
+
+    def test_every_other_status_is_capped(self):
+        for status in NON_CONFIRMED_STATUSES:
+            f = build_finding(_finding("critical"), _state(), "fixed",
+                              REACHED_POC, "", status)
+            assert f["metadata"]["verified"] is False, status
+            assert f["metadata"]["reachability_proven"] is False, status
+            assert f["severity"] == "informational", status
+
+    def test_formatter_never_shows_confirmed_for_non_confirmed(self):
+        for status in NON_CONFIRMED_STATUSES:
+            if not status:
+                continue  # empty qc -> no VERIFICATION STATUS block at all
+            md = _report({"qc_status": status, "poc_test_code": REACHED_POC,
+                          "forge_output": ""})
+            assert "**CONFIRMED**" not in md, status
+            assert "[UNVERIFIED]" in md or "[FORCED-STATE]" in md, status

@@ -93,13 +93,16 @@ def build_finding(finding, state, fixed_code, test_suite, forge_output, qc_statu
     }
 
     verified = (qc_status == "confirmed")
+    forced = (qc_status == "confirmed_forced")
     severity = finding.get("severity_guess", "medium")
     if not verified:
         # Unverified findings are hardening recommendations, never
         # vulnerabilities: cap severity and label the title so no reader
         # (human or downstream automation) can mistake it for a proven bug.
+        # A forced-state repro is a distinct, more accurate label: the invariant
+        # DID break, but only from a hand-constructed state (reachability unproven).
         severity = "informational"
-        title = "[UNVERIFIED] " + title
+        title = ("[FORCED-STATE] " if forced else "[UNVERIFIED] ") + title
 
     result = {
         "contract": state.get("contract_name", "unknown"),
@@ -122,6 +125,7 @@ def build_finding(finding, state, fixed_code, test_suite, forge_output, qc_statu
             "iterations": state.get("iterations", 0),
             "status": qc_status,
             "verified": verified,
+            "reachability_proven": verified,
             "poc_forces_state": detect_forced_state(test_suite),
             "qc_asserted": extract_qc_reason(forge_output),
         },

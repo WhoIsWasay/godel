@@ -607,6 +607,25 @@ def _gatekeeper_verify(state, gatekeeper, finding, remaining_findings,
             "supervisor_critique": None,
             "messages": [AIMessage(content="[GATEKEEPER]: Bug CONFIRMED in EVM execution.")]
         }
+    elif qc_status == "confirmed_forced":
+        new_bug = {
+            "finding": finding,
+            "z3_result": state.get("z3_result"),
+            "bug_report": state.get("bug_report", "") + "\n\n[QC REACHABILITY WARNING] The invariant broke in the EVM, but ONLY after the PoC force-constructed the counterexample storage via vm.store/vm.etch. This proves the math is violable FROM that state; it does NOT prove the state is reachable through real public calls (it may be a spurious Z3 over-approximation). MANUAL REACHABILITY REVIEW REQUIRED.",
+            "poc_test_code": test_suite,
+            "forge_output": forge_output,
+            "qc_status": qc_status,
+            "unverified": True,
+            "materialized_filename": real_filename,
+        }
+        current_bugs = state.get("verified_bugs", [])
+        return {
+            "verified_bugs": current_bugs + [new_bug],
+            "findings": remaining_findings[1:],
+            "executor_runs": 0,
+            "supervisor_critique": None,
+            "messages": [AIMessage(content="[GATEKEEPER]: Bug reproduced ONLY from a FORCED state (vm.store/etch). Reachability unproven — pushing to manual review, not a clean confirmation.")]
+        }
     elif qc_status == "property_held":
         return {
             "findings": remaining_findings[1:],

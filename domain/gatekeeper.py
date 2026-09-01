@@ -82,6 +82,21 @@ def classify_forge_json(stdout_text: str, combined_output: str = ""):
     return ("property_held", len(results))
 
 
+def downgrade_forced_confirmation(verdict: str, test_code: str) -> str:
+    """A forge FAIL is only a SOUND confirmation when the PoC reached the
+    vulnerable state through real public/external calls. If it instead
+    force-constructs storage via vm.store/vm.etch, the FAIL merely
+    re-demonstrates the state Z3 *assumed* — it never proves that state is
+    reachable. Downgrade 'confirmed' to 'confirmed_forced' in that case so it
+    is surfaced as a reachability-unproven lead (manual review, capped
+    severity), never as a clean confirmed vulnerability. Other verdicts pass
+    through untouched."""
+    if verdict != "confirmed":
+        return verdict
+    from domain.schema import detect_forced_state
+    return "confirmed_forced" if detect_forced_state(test_code) else verdict
+
+
 class FoundryGatekeeper:
     def __init__(self, project_root: str = ".", verifier_agent=None, debug_dir: str = None):
         self.project_root = project_root
@@ -311,9 +326,13 @@ class FoundryGatekeeper:
                     structured = classify_forge_json(stdout, combined_output)
                     if structured is not None:
                         verdict, n_tests = structured
+                        verdict = downgrade_forced_confirmation(verdict, current_test_code)
                         self._dump_debug_artifact(debug_tag, attempt, current_test_code, combined_output, debug_dir)
                         if verdict == "confirmed":
                             print(f"      [QC PASSED] Invariant broken in JSON report ({n_tests} result(s)). Defect is active and verified!")
+                            return verdict, combined_output
+                        elif verdict == "confirmed_forced":
+                            print("      [QC FORCED-STATE] Invariant broke, but the PoC force-constructs the storage state (vm.store/vm.etch). Natural reachability NOT proven — flagging for manual review, not a clean confirmation.")
                             return verdict, combined_output
                         elif verdict == "property_held":
                             print(f"      [QC FAILED] {n_tests} test(s) ran clean but property held (no bug found). Discarding noise.")
@@ -339,9 +358,13 @@ class FoundryGatekeeper:
                                   "harness problem, NOT a confirmed bug.")
                             self._dump_debug_artifact(debug_tag, attempt, current_test_code, combined_output, debug_dir)
                             return "harness_error", combined_output
-                        print("      [QC PASSED] Invariant broken successfully. Defect is active and verified!")
+                        verdict = downgrade_forced_confirmation("confirmed", current_test_code)
+                        if verdict == "confirmed_forced":
+                            print("      [QC FORCED-STATE] Invariant broke, but the PoC force-constructs the storage state (vm.store/vm.etch). Natural reachability NOT proven — flagging for manual review, not a clean confirmation.")
+                        else:
+                            print("      [QC PASSED] Invariant broken successfully. Defect is active and verified!")
                         self._dump_debug_artifact(debug_tag, attempt, current_test_code, combined_output, debug_dir)
-                        return "confirmed", combined_output
+                        return verdict, combined_output
 
                     # 3b. ABNORMAL TERMINATION: forge exited non-zero WITHOUT a
                     # FAIL. That is a crash (harness panic, OOM, internal error),

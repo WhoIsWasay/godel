@@ -14,6 +14,12 @@ from domain import config
 
 SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 CONFIRMED = {"confirmed", "broken_invariant"}
+# Verdicts that are NOT a clean on-chain reproduction get an honest label
+# instead of a cryptic raw status. confirmed_forced reproduced only from a
+# hand-constructed storage state, so reachability is unproven.
+VERDICT_LABELS = {
+    "confirmed_forced": "⚠️ forced-state (reachability unproven)",
+}
 
 
 def main():
@@ -46,7 +52,7 @@ def main():
     for f in rows:
         sev = (f.get("severity") or "?").upper()
         qc = f.get("qc_status") or "?"
-        verdict = "✅ reproduced on-chain" if qc in CONFIRMED else qc
+        verdict = "✅ reproduced on-chain" if qc in CONFIRMED else VERDICT_LABELS.get(qc, qc)
         title = (f.get("title") or "Finding").splitlines()[0][:100]
         print(f"| {sev} | `{f.get('contract', '?')}` | `{f.get('function', '?')}` "
               f"| {verdict} | {title} |")
