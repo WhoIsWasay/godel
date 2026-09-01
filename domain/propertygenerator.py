@@ -69,6 +69,7 @@ class PropertyGenerator:
 ```
 Model quality: {semantic_harness['quality']}.
 Unmodeled (havocked, i.e. free) parts: {json.dumps(semantic_harness['untranslated'], indent=2)}
+Havocked (UNBOUND) symbols — FREE variables, asserting on them proves NOTHING: {json.dumps(semantic_harness.get('unbound_locals', []))}
 Standing assumptions: {json.dumps(semantic_harness['assumptions'])}
 {"IMPORTANT: This model is PARTIAL quality — some guards/transitions are havocked (unconstrained). SAT results may be false positives from the over-approximation. Be extra careful: only flag BUG FOUND when the counterexample makes sense given the unmodeled parts listed above." if semantic_harness["quality"] == "PARTIAL" else ""}
 
@@ -86,6 +87,7 @@ FORBIDDEN in harness mode:
 - Do NOT create your own Solver() (use the one from build_model())
 - Do NOT re-encode Solidity semantics (the model already encodes them)
 - Do NOT use Array/Store/Select (mappings are pre-modeled in V)
+- Do NOT assert on any symbol listed in _unbound_locals — they are FREE variables with no defining equality, so e.g. `V['loc_shares'] == 0` is trivially SAT and proves NOTHING (the strict lint rejects such scripts). Express the violation with bound symbols / inline arithmetic instead, e.g. `(V['arg_assets'] * V['totalSupply']) / V['totalAssets'] == 0`
 - Steps 3, 5, 5.5 of the general prompt are OVERRIDDEN — the harness replaces them
 
 Available V symbols: {sorted(semantic_harness.get('symbols', dict()).keys())}

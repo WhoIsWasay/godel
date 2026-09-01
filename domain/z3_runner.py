@@ -1,5 +1,6 @@
 import ast
 import os
+import re
 import sys
 import subprocess
 import tempfile
@@ -49,14 +50,84 @@ def _classify_sentinels(output: str) -> tuple[str, str | None]:
     )
 
 
+_UNBOUND_LIST_RE = re.compile(r"_unbound_locals\s*=\s*\[([^\]]*)\]")
+# An expression side "counts" as a binding when it contains any identifier
+# or arithmetic operator — i.e. anything beyond a bare numeric constant.
+_BINDING_EXPR_RE = re.compile(r"[A-Za-z_*/+]")
+
+
+def _referenced_unbound_locals(z3_code: str) -> list:
+    """Unbound (havocked) harness symbols the script actually references
+    through V['key']. No-ops on scripts without the harness-emitted
+    _unbound_locals list (standalone mode)."""
+    m = _UNBOUND_LIST_RE.search(z3_code)
+    if not m:
+        return []
+    keys = re.findall(r"['\"]([^'\"]+)['\"]", m.group(1))
+    return [k for k in keys
+            if re.search(rf"V\[\s*['\"]{re.escape(k)}['\"]\s*\]", z3_code)]
+
+
+def _has_binding_equality(z3_code: str, key: str) -> bool:
+    """True when V['key'] (or a direct alias of it) is equated somewhere to a
+    NON-CONSTANT expression. `V['key'] == 0` alone is an assertion on a free
+    variable, not a binding, and does not count."""
+    ek = re.escape(key)
+    ref = rf"V\[\s*['\"]{ek}['\"]\s*\]"
+    candidates = [
+        rf"{ref}\s*==\s*([^\n,)]*)",          # V['k'] == rhs
+        rf"Eq\(\s*{ref}\s*,\s*([^\n,]*)",     # Eq(V['k'], rhs)
+        rf"([^\n=!]*)==\s*{ref}",             # lhs == V['k']
+    ]
+    # One aliasing level: x = V['k'] then `x == expr` also binds.
+    for alias in re.findall(rf"(\w+)\s*=\s*{ref}", z3_code):
+        candidates.append(rf"\b{re.escape(alias)}\b\s*==\s*([^\n,)]*)")
+    for pat in candidates:
+        for m in re.finditer(pat, z3_code):
+            side = m.group(1)
+            side = re.sub(rf"{ref}", "", side)  # ignore the symbol itself
+            if _BINDING_EXPR_RE.search(side):
+                return True
+    return False
+
+
+def _lint_unbound_local_assertions(z3_code: str) -> str | None:
+    """Rejects vacuous 'proofs' against havocked harness symbols.
+
+    The deterministic harness emits `_unbound_locals` — registry symbols whose
+    defining write could not be encoded (loop / unencodable branch context)
+    and which are therefore FREE variables in the model. Asserting e.g.
+    `V['loc_shares'] == 0` on a free variable is trivially SAT — exactly the
+    false 'confirmed' zero-share-deposit finding shipped in the MiniVault
+    realtest run. Any reference to an unbound symbol must carry a defining
+    equality tying it to a non-constant expression; otherwise the script is
+    rejected with actionable feedback so the specifier regenerates it with
+    the symbol bound or the arithmetic inlined."""
+    offenders = [k for k in _referenced_unbound_locals(z3_code)
+                 if not _has_binding_equality(z3_code, k)]
+    if not offenders:
+        return None
+    k = offenders[0]
+    return (
+        f"Quality gate: V[{k!r}] is HAVOCKED (listed in _unbound_locals — the "
+        f"harness emitted NO defining equality for it, so it is a free "
+        f"variable). Asserting on it (e.g. V[{k!r}] == 0) is trivially SAT and "
+        f"proves nothing. Either bind it first to its Solidity defining "
+        f"expression (solver.add(V[{k!r}] == <arithmetic over bound V "
+        f"symbols>)), or express the violation directly in terms of bound "
+        f"symbols."
+    )
+
+
 def _lint_property_quality(z3_code: str) -> str | None:
     """Structural quality gate for LLM-generated property scripts. Returns
     None when the script can plausibly produce a real verdict, else a
     rejection reason fed back to the specifier for repair.
 
-    Prevents the two degenerate property classes deterministically:
+    Prevents the degenerate property classes deterministically:
     - LOOSE scripts (no check / no add) can never produce a verdict.
-    - Scripts without a SANITY probe can silently report vacuous UNSATs."""
+    - Scripts without a SANITY probe can silently report vacuous UNSATs.
+    - Scripts asserting on havocked (unbound) symbols produce vacuous SATs."""
     tree = ast.parse(z3_code)
 
     has_add = False
@@ -81,7 +152,7 @@ def _lint_property_quality(z3_code: str) -> str | None:
                 "s.push(); print('SANITY:', s.check()); s.pop(). "
                 "Without it, an over-constrained model yields a vacuous UNSAT "
                 "that masquerades as a safety proof.")
-    return None
+    return _lint_unbound_local_assertions(z3_code)
 
 
 # --- Safety gate -----------------------------------------------------------

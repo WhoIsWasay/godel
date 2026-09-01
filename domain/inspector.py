@@ -9,6 +9,18 @@ from domain.config import PROMPTS_DIR
 from domain.llm_utils import (EmptyResponseError, call_with_retry,
                               content_to_text, guarded_invoke)
 
+# Severity ordering used when two findings collapse to the same root cause:
+# the merged result must retain the STRONGER severity so a critical duplicate
+# is never downgraded to (or dropped in favour of) a weaker paraphrase.
+_SEVERITY_RANK = {
+    "critical": 4, "high": 3, "medium": 2, "low": 1, "informational": 0,
+}
+
+
+def _severity_rank(finding: dict) -> int:
+    """Maps a finding's severity_guess to a comparable rank (default medium)."""
+    return _SEVERITY_RANK.get(str(finding.get("severity_guess", "")).strip().lower(), 2)
+
 
 class Inspector:
 
@@ -141,12 +153,12 @@ class Inspector:
         for func_name, group in grouped.items():
             kept = []
             for finding in group:
-                is_dup = False
+                dup_index = None
                 finding_code_lines = get_significant_lines(
                     finding.get("relevant_code", "")
                 )
 
-                for existing in kept:
+                for idx, existing in enumerate(kept):
                     existing_code_lines = get_significant_lines(
                         existing.get("relevant_code", "")
                     )
@@ -166,6 +178,19 @@ class Inspector:
                         if smaller > 0 and len(intersection) >= smaller:
                             strong_code_overlap = True
 
+                    # Same-root-cause merge: a one- or two-line bug locus is
+                    # frequently reported twice with completely different
+                    # paraphrased intents (e.g. an accuracy error and an
+                    # underflow DoS both pointing at one mis-computed line).
+                    # Their intent Jaccard is then far below any sane threshold,
+                    # so rely on the code locus alone: identical AND tiny
+                    # significant-line sets mean the same defect, merge them.
+                    identical_tiny = (
+                        bool(finding_code_lines)
+                        and finding_code_lines == existing_code_lines
+                        and len(finding_code_lines) <= 2
+                    )
+
                     intent_sim = self._word_overlap_ratio(
                         finding.get("intent", ""), existing.get("intent", "")
                     )
@@ -178,14 +203,18 @@ class Inspector:
                     if strong_code_overlap:
                         threshold = 0.15
 
-                    if has_code_overlap and (
-                        intent_sim > threshold or constraint_sim > 0.5
+                    if identical_tiny or (
+                        has_code_overlap
+                        and (intent_sim > threshold or constraint_sim > 0.5)
                     ):
-                        is_dup = True
+                        dup_index = idx
                         break
 
-                if not is_dup:
+                if dup_index is None:
                     kept.append(finding)
+                elif _severity_rank(finding) > _severity_rank(kept[dup_index]):
+                    # Retain the stronger finding when a duplicate collapses.
+                    kept[dup_index] = finding
             result.extend(kept)
 
         for i, f in enumerate(result, start=1):

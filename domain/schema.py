@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from datetime import datetime
 
 from domain.extractor import OutputExtractor
@@ -33,6 +34,44 @@ def normalize_counterexample(cex: dict) -> dict:
     return {name: normalize_value(name, value) for name, value in cex.items()}
 
 
+# ==========================================
+# EVIDENCE HONESTY (MiniVault realtest post-mortem)
+# A finding whose EVM verification never reproduced the bug (harness_error,
+# inconclusive, compile failures...) used to ship with the hunter's full
+# severity and a "confirmed"-sounding report — the deposit div-by-zero false
+# positive rode an unreachable Z3 state all the way into submissions/.
+# These helpers make the evidence quality machine-readable and cap what an
+# unverified finding may claim.
+# ==========================================
+
+# vm.store/vm.etch force storage/code directly: a PoC using them demonstrates
+# the violation ONLY from a hand-constructed state — natural reachability
+# through public calls is not proven by such a test.
+_FORCED_STATE_RE = re.compile(r"\bvm\.(store|etch)\s*\(")
+_QC_REASON_RE = re.compile(r'"reason"\s*:\s*"((?:[^"\\]|\\.){1,300})"')
+
+
+def detect_forced_state(test_code: str) -> bool:
+    """True when the PoC forces contract state via vm.store/vm.etch."""
+    return bool(test_code) and bool(_FORCED_STATE_RE.search(test_code))
+
+
+def extract_qc_reason(forge_output: str) -> str | None:
+    """First assertion/failure reason forge reported — what the EVM test
+    ACTUALLY proved. Surfaced in metadata so a claim/evidence mismatch
+    (report says X, forge asserted Y) is visible without digging through
+    100KB of JSON logs."""
+    if not forge_output:
+        return None
+    m = _QC_REASON_RE.search(forge_output)
+    if not m:
+        return None
+    try:
+        return json.loads(f'"{m.group(1)}"')
+    except Exception:
+        return m.group(1)
+
+
 def build_finding(finding, state, fixed_code, test_suite, forge_output, qc_status) -> dict:
     raw_intent = finding.get("intent") or "Logic Flaw Detected"
     title = " ".join(raw_intent.split()[:8]).replace('"', "").replace("'", "") + "..."
@@ -53,10 +92,19 @@ def build_finding(finding, state, fixed_code, test_suite, forge_output, qc_statu
         "p_at_5": (rag_precisions.get(5) or {}).get("p_at_k"),
     }
 
+    verified = (qc_status == "confirmed")
+    severity = finding.get("severity_guess", "medium")
+    if not verified:
+        # Unverified findings are hardening recommendations, never
+        # vulnerabilities: cap severity and label the title so no reader
+        # (human or downstream automation) can mistake it for a proven bug.
+        severity = "informational"
+        title = "[UNVERIFIED] " + title
+
     result = {
         "contract": state.get("contract_name", "unknown"),
         "function": finding.get("target_function", "unknown"),
-        "severity": finding.get("severity_guess", "medium"),
+        "severity": severity,
         "title": title,
         "summary": raw_intent,
         "root_cause": finding.get("constraint", ""),
@@ -73,6 +121,9 @@ def build_finding(finding, state, fixed_code, test_suite, forge_output, qc_statu
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "iterations": state.get("iterations", 0),
             "status": qc_status,
+            "verified": verified,
+            "poc_forces_state": detect_forced_state(test_suite),
+            "qc_asserted": extract_qc_reason(forge_output),
         },
     }
 

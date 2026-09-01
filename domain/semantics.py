@@ -424,12 +424,25 @@ class HarnessEncoder:
         if f.get("has_external_call") and quality == MODEL_QUALITY_FULL:
             quality = MODEL_QUALITY_PARTIAL
 
+        # A loc_* symbol is UNBOUND when no emitted equality constrains it:
+        # havocked writes (loop / unencodable branch context) still register
+        # the symbol, leaving the variable free. Asserting a violation on a
+        # free variable is trivially SAT — a vacuous "proof". The strict lint
+        # in z3_runner uses this list to reject such scripts before execution.
+        emitted = "\n".join(guard_codes + trans_codes)
+        unbound_locals = [
+            friendly for friendly, z in self.registry.items()
+            if friendly.startswith("loc_")
+            and not re.search(rf"(?<!\w){re.escape(z)}\s*==", emitted)
+        ]
+
         return {
             "function_key": key,
             "guard_codes": guard_codes,
             "trans_codes": trans_codes,
             "quality": quality,
             "untranslated": untranslated[:20],
+            "unbound_locals": sorted(unbound_locals),
             "registry": dict(self.registry),
             "decls": list(self.decls),
             "bounds": list(self.bounds),
@@ -453,6 +466,9 @@ class HarnessEncoder:
         lines.append("    _bounds = [" + ", ".join(raw["bounds"]) + "]")
         lines.append("    _guards = [" + ", ".join(raw["guard_codes"]) + "]")
         lines.append("    _transitions = [" + ", ".join(raw["trans_codes"]) + "]")
+        lines.append("    # Havocked locals: NO defining equality was emitted for these.")
+        lines.append("    # Asserting on them yields vacuous SAT - the strict lint rejects that.")
+        lines.append("    _unbound_locals = [" + ", ".join(repr(k) for k in raw["unbound_locals"]) + "]")
         lines.append("    solver = Solver()")
         lines.append("    solver.add(_bounds + _guards + _transitions)")
         v_items = ", ".join(f"{k!r}: {z}" for k, z in raw["registry"].items())
@@ -465,6 +481,7 @@ class HarnessEncoder:
             "quality": raw["quality"],
             "code": "\n".join(lines),
             "untranslated": raw["untranslated"],
+            "unbound_locals": raw["unbound_locals"],
             "assumptions": [
                 "uint256 modeled as bounded Int [0, 2**256-1]: individual "
                 "variables are capped, so Z3 can detect when arithmetic results "
@@ -475,6 +492,9 @@ class HarnessEncoder:
                 "remain valid proofs; SAT now also catches overflow at the boundary",
                 "integer division truncation exact only for non-negative operands",
                 "mapping slots modeled per concrete index seen in source",
+                "symbols listed in _unbound_locals are HAVOCKED (free): any "
+                "assertion on them proves nothing and is rejected by the strict "
+                "lint -- express violations via bound symbols or inline arithmetic",
             ],
             "symbols": raw["registry"],
         }
@@ -497,6 +517,7 @@ class HarnessEncoder:
         merged_registry: dict[str, str] = {}
         quality = MODEL_QUALITY_CHAIN
         untranslated: list[str] = []
+        all_unbound: list[str] = []
         prev_new_map: dict[str, str] = {}  # base_var -> z3_new_name
 
         for call_idx, fn_name in enumerate(function_names, 1):
@@ -510,6 +531,7 @@ class HarnessEncoder:
             all_bounds.extend(raw["bounds"])
             all_guards.extend(raw["guard_codes"])
             all_transitions.extend(raw["trans_codes"])
+            all_unbound.extend(raw.get("unbound_locals", []))
 
             if call_idx > 1 and prev_new_map:
                 for sv in sorted(self.state_vars):
@@ -546,6 +568,9 @@ class HarnessEncoder:
         lines.append("    _bounds = [" + ", ".join(all_bounds) + "]")
         lines.append("    _guards = [" + ", ".join(all_guards) + "]")
         lines.append("    _transitions = [" + ", ".join(all_transitions) + "]")
+        lines.append("    # Havocked locals: NO defining equality was emitted for these.")
+        lines.append("    # Asserting on them yields vacuous SAT - the strict lint rejects that.")
+        lines.append("    _unbound_locals = [" + ", ".join(repr(k) for k in sorted(set(all_unbound))) + "]")
         lines.append("    solver = Solver()")
         lines.append("    solver.add(_bounds + _guards + _transitions)")
         v_items = ", ".join(f"{k!r}: {z}" for k, z in merged_registry.items())
@@ -558,11 +583,14 @@ class HarnessEncoder:
             "quality": quality,
             "code": "\n".join(lines),
             "untranslated": untranslated[:20],
+            "unbound_locals": sorted(set(all_unbound)),
             "assumptions": [
                 "chain model: post-state of each call bridged to pre-state of next",
                 "each call independently over-approximates (PARTIAL quality possible)",
                 "uint256 modeled as bounded Int [0, 2**256-1]",
                 "external calls havocked per-call (reentrancy not modeled across chain)",
+                "symbols listed in _unbound_locals are HAVOCKED (free): any "
+                "assertion on them proves nothing and is rejected by the strict lint",
             ],
             "symbols": merged_registry,
         }

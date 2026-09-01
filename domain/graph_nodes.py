@@ -318,11 +318,11 @@ A <cfg_abstraction> block may be present inside the isolation packet. It is DETE
                              and empty_passes == total_passes_attempted)
 
     findings = all_findings
-    if passes > 1 and len(findings) > 1:
+    if len(findings) > 1:
         for i, f in enumerate(findings, start=1):
             f.setdefault("id", i)
         findings = inspector.deduplicate(findings)
-        print(f"      [BUG HUNTER] {passes} passes merged: {len(all_findings)} raw -> {len(findings)} unique findings")
+        print(f"      [BUG HUNTER] dedup across {passes} pass(es): {len(all_findings)} raw -> {len(findings)} unique findings")
 
     # Every pass failed and nothing was recovered: this must never
     # masquerade as a clean safety verdict — flag it so routing retries
@@ -622,6 +622,7 @@ def _gatekeeper_verify(state, gatekeeper, finding, remaining_findings,
             "poc_test_code": test_suite,
             "forge_output": forge_output,
             "qc_status": qc_status,
+            "unverified": True,
             "materialized_filename": real_filename,
         }
         current_bugs = state.get("verified_bugs", [])
@@ -652,7 +653,12 @@ def fixer_node(state: GraphState, fixer: FixerAgent, formatter: SubmissionFormat
         stem=state["contract_name"],
         finding=finding,
         state=state,
-        fixed_code=fixed_code
+        fixed_code=fixed_code,
+        qc={
+            "qc_status": latest_bug.get("qc_status", ""),
+            "poc_test_code": latest_bug.get("poc_test_code", ""),
+            "forge_output": latest_bug.get("forge_output", ""),
+        },
     )
 
     contract_name = state.get("contract_name", "unknown")

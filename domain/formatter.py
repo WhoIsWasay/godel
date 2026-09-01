@@ -38,10 +38,18 @@ class SubmissionFormatter:
             "```\n"
         )
 
-    def compile_bounty_report(self, finding_idx: int, stem: str, finding: dict, state: dict, fixed_code: str) -> str:
+    def compile_bounty_report(self, finding_idx: int, stem: str, finding: dict, state: dict, fixed_code: str, qc: dict = None) -> str:
         """
         Compiles all runtime data vectors into a single, comprehensive markdown string.
+
+        qc (when given) carries the EVM verification evidence:
+        {"qc_status", "poc_test_code", "forge_output"}. Findings that were not
+        reproduced by forge are labeled UNVERIFIED and capped at informational;
+        forced-state PoCs (vm.store/vm.etch) and the actual forge assertion
+        reason are disclosed so claim/evidence mismatches are visible.
         """
+        from domain.schema import detect_forced_state, extract_qc_reason
+
         func_name = finding.get("target_function", "unknown")
         
         # # Safely extract and truncate the intent description into a clean title line
@@ -59,9 +67,17 @@ class SubmissionFormatter:
         # Safe extraction of the trace log or default message if none exists
         solver_trace_log = state.get("bug_report") or "SAT violation verified."
 
+        qc = qc or {}
+        qc_status = qc.get("qc_status") or ""
+        verified = (qc_status == "confirmed")
+        severity_label = finding.get("severity_guess", "medium").upper()
+        if qc_status and not verified:
+            severity_label = "INFORMATIONAL (UNVERIFIED)"
+            title_summary = "[UNVERIFIED] " + title_summary
+
         # Interpolate variables safely into the string layout without formatting escapes
         compiled_markdown = self.template.format(
-            severity_label=finding.get("severity_guess", "medium").upper(),
+            severity_label=severity_label,
             vulnerability_title= title_summary,
             function_name= func_name,
             intent_description= raw_intent,
@@ -71,7 +87,31 @@ class SubmissionFormatter:
             proof_file_name=proof_file,
             fixed_code_snippet=fixed_code
         )
-        
+
+        if qc_status:
+            lines = ["\n### VERIFICATION STATUS\n"]
+            if verified:
+                lines.append(f"- EVM verification: **CONFIRMED** (qc_status={qc_status}).")
+            else:
+                lines.append(
+                    f"- EVM verification: **NOT REPRODUCED** (qc_status={qc_status}). "
+                    "This entry is a HARDENING RECOMMENDATION for manual review, "
+                    "NOT a confirmed vulnerability. The Z3 model over-approximates: "
+                    "the counterexample state may be unreachable through real call "
+                    "sequences."
+                )
+            if detect_forced_state(qc.get("poc_test_code") or ""):
+                lines.append(
+                    "- The EVM PoC force-constructs the counterexample storage state "
+                    "via `vm.store`/`vm.etch`. It demonstrates the violation FROM that "
+                    "state; natural reachability through public calls is NOT proven "
+                    "by this test."
+                )
+            qc_reason = extract_qc_reason(qc.get("forge_output") or "")
+            if qc_reason:
+                lines.append(f"- What the EVM test actually asserted: `{qc_reason}`")
+            compiled_markdown += "\n".join(lines) + "\n"
+
         return compiled_markdown
 
     # --- ARCHITECTURAL BACKUP ALIAS ---
