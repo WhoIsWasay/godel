@@ -119,6 +119,65 @@ def test_propertygenerator_wraps_xml_tags():
     assert "shares must be > 0" in user
 
 
+# ------------------------------------------- SPECIFIER GROUNDING (warm-seeded)
+# The specifier used to pass ONLY finding['intent'] into build_prompt, dropping
+# the invariant (constraint/relevant_code) and the human's concrete
+# counterexample — the exact grounding a warm-seeded MCP re-confirm supplies.
+# These lock in that all of it now reaches the prompt.
+
+def test_grounded_intent_folds_all_fields():
+    from domain.graph_nodes import _grounded_intent
+    out = _grounded_intent({
+        "intent": "base intent",
+        "constraint": "shares = (assets * totalSupply) / totalAssets truncates to 0",
+        "relevant_code": "assets > 0 => shares > 0 (Anti-Dilution)",
+        "counterexample": {"assets": 1, "totalSupply": 1, "totalAssets": 1000},
+    })
+    assert "base intent" in out
+    assert "truncates to 0" in out            # constraint / root cause
+    assert "Anti-Dilution" in out             # invariant / relevant_code
+    assert '"totalAssets": 1000' in out       # concrete witness, JSON-encoded
+
+
+def test_grounded_intent_no_extras_is_just_intent():
+    from domain.graph_nodes import _grounded_intent
+    assert _grounded_intent({"intent": "only this"}) == "only this"
+    assert _grounded_intent({}) == ""
+
+
+def test_specifier_feeds_invariant_and_witness_into_prompt(monkeypatch):
+    from domain.graph_nodes import specifier_node
+    from domain.propertygenerator import PropertyGenerator
+    from unittest.mock import patch
+
+    # RAG must not touch the network in a unit test.
+    monkeypatch.setattr("domain.rag.retrieve_findings_for_specifier",
+                        lambda *a, **k: ([], {}))
+
+    mock = MockLLM(response_content="```python\nfrom z3 import *\nsolver, V = build_model()\n```")
+    gen = PropertyGenerator(mock)
+    state = {
+        "user_contract": "contract MiniVault { function deposit(uint256 assets) external {} }",
+        "findings": [{
+            "target_function": "deposit",
+            "intent": "A non-zero deposit can mint zero shares.",
+            "constraint": "shares = (assets * totalSupply) / totalAssets truncates to 0",
+            "relevant_code": "assets > 0 => shares > 0 (Anti-Dilution, Invariant 1)",
+            "counterexample": {"assets": 1, "totalSupply": 1, "totalAssets": 1000},
+        }],
+        "semantic_harness": None,
+        "supervisor_critique": None,
+    }
+
+    with patch("domain.propertygenerator.call_with_retry", side_effect=lambda fn: fn()):
+        specifier_node(state, gen)
+
+    user = _get_user_content(mock.last_messages)
+    assert "Anti-Dilution" in user            # invariant reached the prompt
+    assert "truncates to 0" in user           # root cause reached the prompt
+    assert "1000" in user                     # concrete witness reached the prompt
+
+
 # ---------------------------------------------------------------- SUPERVISOR
 
 def test_supervisor_wraps_xml_tags():

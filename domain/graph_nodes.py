@@ -363,6 +363,36 @@ def _active_harness(state: GraphState) -> dict | None:
     return state.get("semantic_harness")
 
 
+def _grounded_intent(finding: dict) -> str:
+    """A finding carries more grounding than `intent` alone: the invariant /
+    root cause (`constraint`), the property or vulnerable slice (`relevant_code`),
+    and — for a warm-seeded MCP re-confirm — a concrete `counterexample` the human
+    already observed. build_prompt consumes ONLY `intent`, so fold the rest in.
+
+    Dropping the witness is what left the specifier guessing and emitting
+    [SUPERVISOR_ALERT] / blank code on a property the deterministic harness CAN
+    express: the MiniVault deposit anti-dilution bug is provably SAT against the
+    generated harness using the seed's own {assets:1, totalSupply:1,
+    totalAssets:1000}, yet that counterexample never reached the prompt. The
+    fixer and formatter already consume all three fields; the specifier should too."""
+    intent = str(finding.get("intent", "") or "").strip()
+    parts = []
+    constraint = str(finding.get("constraint", "") or "").strip()
+    if constraint:
+        parts.append(f"Invariant / root cause to disprove: {constraint}")
+    relevant = str(finding.get("relevant_code", "") or "").strip()
+    if relevant:
+        parts.append(f"Property / relevant code: {relevant}")
+    cex = finding.get("counterexample")
+    if isinstance(cex, dict) and cex:
+        parts.append(
+            "Concrete counterexample already observed — pin these values to "
+            f"reproduce the violation, then generalize: {json.dumps(cex)}")
+    if parts:
+        intent = (intent + "\n\n" if intent else "") + "\n".join(parts)
+    return intent
+
+
 def specifier_node(state: GraphState, generator: PropertyGenerator):
     """Translates the finding into a Z3 property."""
     
@@ -379,7 +409,7 @@ def specifier_node(state: GraphState, generator: PropertyGenerator):
         logger.warning("specifier RAG retrieval failed (non-fatal): %s", e)
 
     generator.build_prompt(
-        {"intent": finding.get("intent", ""), "queries": rag_diag.get("queries", [])},
+        {"intent": _grounded_intent(finding), "queries": rag_diag.get("queries", [])},
         state["user_contract"],
         rag_findings,
         semantic_harness=_active_harness(state),
