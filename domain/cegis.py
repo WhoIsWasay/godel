@@ -26,6 +26,18 @@ logger = logging.getLogger(__name__)
 
 _CEX_PAIR_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_$.]*)\s*[:=]\s*(-?\d+)")
 
+# Zero-arg build_model() call site (the property's entry point). The harness
+# definition `def build_model(witness_bound=None):` is NOT matched — its parens
+# are non-empty — so injection only rewrites the call, never the definition.
+_BUILD_MODEL_CALL_RE = re.compile(r"\bbuild_model\(\s*\)")
+
+
+def _inject_witness_bound(z3_code: str, bound: int) -> str:
+    """Rewrites build_model() -> build_model(witness_bound=<bound>) so the SAME
+    composed harness script re-solves with every uint256 symbol additionally
+    capped to `bound`. Returns z3_code unchanged when there is no call site."""
+    return _BUILD_MODEL_CALL_RE.sub(f"build_model(witness_bound={bound})", z3_code)
+
 
 class CEGIS:
     with open(config.PROMPTS_DIR / "cegis_prompt.txt", "r", encoding="utf-8") as _f:
@@ -98,8 +110,14 @@ class CEGIS:
         result["repairs_used"] = repairs
         result["deterministic_repairs"] = deterministic
         if result.get("status") == "sat":
-            result["counterexample"] = self.extract_counterexample(
-                result.get("output") or "")
+            cex = self.extract_counterexample(result.get("output") or "")
+            minimized = self._minimize_witness(z3_code, cex, attempts)
+            if minimized is not None:
+                minimized["repairs_used"] = repairs
+                minimized["deterministic_repairs"] = deterministic
+                result = minimized
+                cex = self.extract_counterexample(result.get("output") or "")
+            result["counterexample"] = cex
         else:
             result["counterexample"] = None
 
@@ -109,6 +127,48 @@ class CEGIS:
         return result
 
     # ------------------------------------------------------------ internals
+    def _minimize_witness(self, z3_code: str, cex: dict, attempts: list) -> dict | None:
+        """Shrinks a huge SAT witness to a Forge-groundable size, soundly.
+
+        Why: Z3 models uint256 as a bounded Int [0, 2**256-1] and does NOT
+        minimize, so a SAT model can land near 2**254 (e.g. arg_assets=2.15e76).
+        The Forge PoC hardcodes those as uint256 constants and its own
+        `assets * totalSupply` overflows -> setUp reverts -> harness_error -> a
+        REAL bug demoted to informational (the MiniVault deposit finding).
+
+        Soundness: each rung only ADDS `sym <= B` to the SAME property. A SAT
+        under a tighter bound is therefore a valid witness of the identical
+        property — every original constraint still holds — just smaller and
+        groundable. If every rung is UNSAT/vacuous/error, the bug genuinely needs
+        large magnitude (overflow class) and we return None to KEEP the original
+        full-range witness. The Phase-1 verdict is never changed; this is a pure
+        Z3 re-solve with no LLM call."""
+        if "build_model(" not in z3_code:
+            return None  # standalone / LLM-improvised script: no bound hook
+        assignments = (cex or {}).get("assignments") or {}
+        if not assignments:
+            return None
+        if max(abs(v) for v in assignments.values()) <= config.WITNESS_GROUNDABLE_MAX:
+            return None  # already groundable — skip the extra re-solves
+
+        for bound in config.WITNESS_MINIMIZE_BOUNDS:
+            bounded_code = _inject_witness_bound(z3_code, bound)
+            if bounded_code == z3_code:
+                return None  # no zero-arg call site to inject into
+            attempt = self.run_z3(bounded_code)
+            status = attempt.get("status")
+            attempts.append({"phase": "minimize", "witness_bound": bound,
+                             "status": status})
+            if status == "sat":
+                attempt["witness_minimized"] = True
+                attempt["witness_bound"] = bound
+                print(f"      [CEGIS] witness minimized to <= {bound} "
+                      f"(groundable in Forge PoC; verdict unchanged)")
+                return attempt
+        print("      [CEGIS] no smaller witness — keeping full-range model "
+              "(bug likely needs large magnitude)")
+        return None
+
     def _repair_script(self, z3_code: str, error: str) -> str | None:
         """Asks the LLM to fix the failing Z3 script. Returns corrected code or None."""
         from langchain_core.messages import SystemMessage, HumanMessage

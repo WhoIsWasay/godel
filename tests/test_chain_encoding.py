@@ -218,8 +218,11 @@ class TestChainEncoding:
         analysis = _mock_analysis()
         encoder = HarnessEncoder(analysis)
         chain = encoder.encode_function_sequence(["approve", "flashLoan"])
-        assert "def build_model():" in chain["code"]
+        assert "def build_model(witness_bound=None):" in chain["code"]
         assert "from z3 import *" in chain["code"]
+        # witness-minimization hook is emitted for the chain harness too
+        assert "_capped = [" in chain["code"]
+        assert "_s <= witness_bound for _s in _capped" in chain["code"]
 
     def test_chain_symbols_suffixed(self):
         analysis = _mock_analysis()

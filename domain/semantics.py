@@ -146,6 +146,7 @@ class HarnessEncoder:
         self.state_vars = {v["name"] for v in analysis.get("storage_layout", [])}
         self.decls: list[str] = []
         self.bounds: list[str] = []
+        self.capped: list[str] = []  # z3 names carrying the uint256 upper bound
         self.registry: dict[str, str] = {}  # friendly key -> z3 name
         self.suffix = suffix  # for chain encoding: "_c1", "_c2", etc.
 
@@ -159,6 +160,7 @@ class HarnessEncoder:
             if bounded:
                 self.bounds.append(f"{suffixed_zname} >= 0")
                 self.bounds.append(f"{suffixed_zname} <= 2**256 - 1")
+                self.capped.append(suffixed_zname)
         return self.registry[suffixed_friendly]
 
     def _scalar_pair(self, name: str):
@@ -446,6 +448,7 @@ class HarnessEncoder:
             "registry": dict(self.registry),
             "decls": list(self.decls),
             "bounds": list(self.bounds),
+            "capped": list(self.capped),
         }
 
     def encode_function(self, focus_function: str) -> dict | None:
@@ -460,10 +463,13 @@ class HarnessEncoder:
             "# Soundness: unmodeled behavior is UNCONSTRAINED (over-approximation).",
             "from z3 import *",
             "",
-            "def build_model():",
+            "def build_model(witness_bound=None):",
         ]
         lines.extend(f"    {d}" for d in raw["decls"])
         lines.append("    _bounds = [" + ", ".join(raw["bounds"]) + "]")
+        lines.append("    _capped = [" + ", ".join(raw["capped"]) + "]")
+        lines.append("    if witness_bound is not None:")
+        lines.append("        _bounds = _bounds + [_s <= witness_bound for _s in _capped]")
         lines.append("    _guards = [" + ", ".join(raw["guard_codes"]) + "]")
         lines.append("    _transitions = [" + ", ".join(raw["trans_codes"]) + "]")
         lines.append("    # Havocked locals: NO defining equality was emitted for these.")
@@ -512,6 +518,7 @@ class HarnessEncoder:
 
         all_decls: list[str] = []
         all_bounds: list[str] = []
+        all_capped: list[str] = []
         all_guards: list[str] = []
         all_transitions: list[str] = []
         merged_registry: dict[str, str] = {}
@@ -529,6 +536,7 @@ class HarnessEncoder:
 
             all_decls.extend(raw["decls"])
             all_bounds.extend(raw["bounds"])
+            all_capped.extend(raw["capped"])
             all_guards.extend(raw["guard_codes"])
             all_transitions.extend(raw["trans_codes"])
             all_unbound.extend(raw.get("unbound_locals", []))
@@ -562,10 +570,13 @@ class HarnessEncoder:
             "# Bridge: Call_N post-state == Call_N+1 pre-state for all storage.",
             "from z3 import *",
             "",
-            "def build_model():",
+            "def build_model(witness_bound=None):",
         ]
         lines.extend(f"    {d}" for d in all_decls)
         lines.append("    _bounds = [" + ", ".join(all_bounds) + "]")
+        lines.append("    _capped = [" + ", ".join(all_capped) + "]")
+        lines.append("    if witness_bound is not None:")
+        lines.append("        _bounds = _bounds + [_s <= witness_bound for _s in _capped]")
         lines.append("    _guards = [" + ", ".join(all_guards) + "]")
         lines.append("    _transitions = [" + ", ".join(all_transitions) + "]")
         lines.append("    # Havocked locals: NO defining equality was emitted for these.")

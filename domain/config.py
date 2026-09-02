@@ -121,6 +121,29 @@ Z3_TIMEOUT_SECONDS   = _env_float("GODEL_Z3_TIMEOUT", 30.0)
 FORGE_TIMEOUT_SECONDS = _env_float("GODEL_FORGE_TIMEOUT", 45.0)
 
 # ==========================================
+# Z3 WITNESS MINIMIZATION (groundability)
+# ==========================================
+# Z3 models uint256 as a bounded Int [0, 2**256-1] and does NOT minimize, so a
+# SAT witness can land near 2**254 (e.g. arg_assets=2.15e76). The Forge PoC
+# hardcodes those as uint256 constants; its own `assets * totalSupply` then
+# overflows -> setUp reverts -> harness_error -> a REAL bug is demoted to
+# informational. After a SAT we re-solve the SAME composed harness script with
+# progressively tighter caps (tight->loose); the first SAT wins, giving the
+# smallest groundable witness. If every rung is UNSAT the bug genuinely needs
+# large magnitude (overflow class) and the ORIGINAL full-range witness is kept.
+# The Phase-1 verdict is never changed -- only the witness is optionally shrunk,
+# and a shrunk witness still satisfies every original constraint.
+WITNESS_MINIMIZE_BOUNDS = tuple(
+    int(x) for x in os.environ.get(
+        "GODEL_WITNESS_BOUNDS", "1000000,1000000000000,1000000000000000000"
+    ).split(",") if x.strip().isdigit()
+)
+# A counterexample value strictly above this is "ungroundable" (products risk
+# uint256 overflow in the PoC), so minimization is attempted. Values at or below
+# it are already realistic and skip the extra (LLM-free) re-solves.
+WITNESS_GROUNDABLE_MAX = int(os.environ.get("GODEL_WITNESS_GROUNDABLE_MAX", 10**18))
+
+# ==========================================
 # LLM RETRY
 # ==========================================
 LLM_RETRY_ATTEMPTS = _env_int("GODEL_LLM_RETRY_ATTEMPTS", 5)

@@ -16,7 +16,7 @@ from domain.formatter import SubmissionFormatter
 from domain.schema import build_finding
 from domain.llm_utils import (EmptyResponseError, call_with_retry,
                               content_to_text, guarded_invoke)
-from domain.semantics import compose_reachability_script
+from domain.semantics import compose_reachability_script, compose_script
 from domain.z3_runner import run_z3
 import uuid
 
@@ -435,8 +435,23 @@ def executor_node(state: GraphState, cegis_tool: CEGIS):
     print(f"      [EXECUTOR] Running symbolic execution (Iteration {state.get('iterations', 0)})...")
     harness = _active_harness(state) or {}
     known_symbols = sorted((harness.get("symbols") or {}).keys())
+
+    # Compose the deterministic harness with the LLM-authored property BEFORE
+    # execution. The specifier returns the property block ALONE (it starts with
+    # `solver, V = build_model()`); build_model is defined by the harness. Without
+    # prepending it, the first run_z3 always NameErrors and CEGIS burns an LLM
+    # repair call to improvise a standalone model — discarding the deterministic
+    # bounds/guards/transitions and guessing uint256 ranges (huge witnesses that
+    # overflow the Forge PoC). Skip when the property already carries its own
+    # `def build_model` (the LLM sometimes echoes the harness) to avoid a
+    # duplicate definition. state["z3_code"] stays property-only so proof.py is
+    # readable; only the executed script is composed.
+    runnable = z3_code
+    if harness.get("code") and "def build_model" not in z3_code:
+        runnable = compose_script(harness, z3_code)
+
     result = cegis_tool.run_with_repair(
-        z3_code,
+        runnable,
         known_symbols=known_symbols,
         focus_function=state.get("current_focus_function"),
     )
