@@ -60,14 +60,52 @@ def _stdout_to_stderr():
 
 
 @mcp.tool()
-def audit_contract(contract_code: str, readme: str = "") -> list:
+def audit_contract(
+    contract_code: str,
+    readme: str = "",
+    target: str = "",
+    prior_findings: list | dict | str | None = None,
+    instructions: str = "",
+) -> list:
     """Run Gödel formal verification on a Solidity contract.
+
+    The mode is chosen automatically from which optional arguments you pass:
+
+    - FULL AUDIT (default): pass `contract_code` (and the `readme` spec). Gödel
+      discovers bugs, proves them with Z3, confirms each with a Foundry PoC, and
+      proposes a fix — across every function.
+    - SCOPED AUDIT: also pass `target` = a function name (e.g. "deposit") to
+      restrict discovery to just that function. Faster and cheaper.
+    - RE-CONFIRM A KNOWN FINDING: pass `prior_findings` — the finding dict(s)
+      from an earlier run or a CI `finding.json` (a list, a single dict, or a
+      JSON string). Gödel SKIPS discovery and re-verifies exactly those findings
+      through Z3 + Foundry. Use this when CI failed, timed out, or left a
+      finding unconfirmed and you want to re-target it with the same hypothesis.
+    - DIRECTED HYPOTHESIS: pass `instructions` (free text, e.g. "check that a
+      small deposit can mint zero shares when the share price is high"),
+      optionally with `target`. Gödel verifies YOUR hypothesis instead of
+      re-guessing one.
+
+    `readme` is the formal specification / reachability answer-key: it states the
+    invariants to prove and which states are reachable, which is what suppresses
+    false positives. Always pass it when you have it.
+
+    `contract_code` may be a whole contract or a bare fragment; a fragment with
+    no enclosing contract/library/interface is auto-wrapped so it compiles. A
+    fragment that needs external imports or base contracts still requires the
+    surrounding code.
 
     Returns a list of finding dicts (contract, function, severity, summary,
     counterexample, z3 proof, Foundry PoC, forge output, fix, qc_status, ...).
     """
     with _stdout_to_stderr():
-        return run_pipeline_code(contract_code, readme)
+        return run_pipeline_code(
+            contract_code,
+            readme,
+            target=target,
+            prior_findings=prior_findings,
+            instructions=instructions,
+        )
 
 
 if __name__ == "__main__":

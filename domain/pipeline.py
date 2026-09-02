@@ -854,19 +854,50 @@ def _discovery_finding(stem: str, broken: dict) -> dict:
     return built
 
 
-def _verify_compositor_finding(finding: dict, raw_contract: str, stem: str,
-                                readme: str, static_analysis, app,
-                                chain_harness=None) -> dict | None:
-    """Routes one Compositor finding through specifier→executor→gatekeeper→fixer.
-    Returns the verified finding dict if Z3+Foundry confirms it, None otherwise.
-    Non-fatal: a verification failure returns None silently."""
+def _build_verify_graph():
+    """Compiles the verifier-only subgraph: specifier→executor→gatekeeper→fixer,
+    entering at specifier so the bug_hunter/supervisor discovery stages are
+    SKIPPED. Used whenever a finding is supplied rather than discovered — the
+    Compositor's cross-function findings and the MCP warm-seeded re-confirm
+    path both run through here. node_* wrappers and route_after_* live in this
+    module (pipeline.py)."""
+    from langgraph.graph import StateGraph, END
+    from domain.state import GraphState
+
+    verify_graph = StateGraph(GraphState)
+    verify_graph.add_node("specifier", node_specifier)
+    verify_graph.add_node("executor", node_executor)
+    verify_graph.add_node("gatekeeper", node_gatekeeper)
+    verify_graph.add_node("fixer", node_fixer)
+
+    verify_graph.add_conditional_edges(
+        "specifier", route_after_specifier,
+        {"executor": "executor", "supervisor": "specifier"})
+    verify_graph.add_conditional_edges(
+        "executor", route_after_executor,
+        {"specifier": "specifier", "gatekeeper": "gatekeeper", END: END})
+    verify_graph.add_conditional_edges(
+        "gatekeeper", route_after_gatekeeper,
+        {"fixer": "fixer", "specifier": "specifier", END: END})
+    verify_graph.add_conditional_edges(
+        "fixer", route_after_fixer,
+        {"specifier": "specifier", END: END})
+
+    verify_graph.set_entry_point("specifier")
+    return verify_graph.compile()
+
+
+def _build_seed_state(finding: dict, raw_contract: str, stem: str, readme: str,
+                      static_analysis, harness=None, chain_harness=None) -> dict:
+    """Builds the initial GraphState that feeds the verifier-only subgraph with
+    a SUPPLIED finding (no hunter). `harness` is a single-function semantic
+    model; `chain_harness` is a multi-call compositional model. The active
+    harness is the single-function one when given, else the chain — matching
+    _active_harness()'s selection in the specifier/executor."""
     target = finding.get("target_function", "")
     first_func = target.split("->")[0].split("→")[0].strip().split("(")[0].strip()
-
-    if not first_func:
-        return None
-
-    initial_state = {
+    active = harness if harness is not None else chain_harness
+    return {
         "user_contract": raw_contract,
         "contract_name": stem,
         "readme_specs": readme,
@@ -882,8 +913,8 @@ def _verify_compositor_finding(finding: dict, raw_contract: str, stem: str,
         "z3_code": "",
         "z3_result": None,
         "slither_result": static_analysis,
-        "semantic_harness": chain_harness,
-        "model_quality": chain_harness["quality"] if chain_harness else None,
+        "semantic_harness": active,
+        "model_quality": active.get("quality") if active else None,
         "bug_report": None,
         "iterations": 0,
         "supervisor_runs": 0,
@@ -899,34 +930,25 @@ def _verify_compositor_finding(finding: dict, raw_contract: str, stem: str,
         "compositional_model_quality": chain_harness["quality"] if chain_harness else None,
     }
 
+
+def _verify_compositor_finding(finding: dict, raw_contract: str, stem: str,
+                                readme: str, static_analysis, app,
+                                chain_harness=None) -> dict | None:
+    """Routes one Compositor finding through specifier→executor→gatekeeper→fixer.
+    Returns the verified finding dict if Z3+Foundry confirms it, None otherwise.
+    Non-fatal: a verification failure returns None silently."""
+    target = finding.get("target_function", "")
+    first_func = target.split("->")[0].split("→")[0].strip().split("(")[0].strip()
+
+    if not first_func:
+        return None
+
+    initial_state = _build_seed_state(
+        finding, raw_contract, stem, readme, static_analysis,
+        chain_harness=chain_harness)
+
     try:
-        from langgraph.graph import StateGraph, END
-        from domain.state import GraphState
-
-        # node_specifier, node_executor, node_gatekeeper, node_fixer, and all
-        # route_after_* functions are defined in this module (pipeline.py).
-        verify_graph = StateGraph(GraphState)
-        verify_graph.add_node("specifier", node_specifier)
-        verify_graph.add_node("executor", node_executor)
-        verify_graph.add_node("gatekeeper", node_gatekeeper)
-        verify_graph.add_node("fixer", node_fixer)
-
-        verify_graph.add_conditional_edges(
-            "specifier", route_after_specifier,
-            {"executor": "executor", "supervisor": "specifier"})
-        verify_graph.add_conditional_edges(
-            "executor", route_after_executor,
-            {"specifier": "specifier", "gatekeeper": "gatekeeper", END: END})
-        verify_graph.add_conditional_edges(
-            "gatekeeper", route_after_gatekeeper,
-            {"fixer": "fixer", "specifier": "specifier", END: END})
-        verify_graph.add_conditional_edges(
-            "fixer", route_after_fixer,
-            {"specifier": "specifier", END: END})
-
-        verify_graph.set_entry_point("specifier")
-        compiled = verify_graph.compile()
-
+        compiled = _build_verify_graph()
         final_state = compiled.invoke(initial_state)
 
         if final_state.get("verified_bugs"):
@@ -1129,9 +1151,14 @@ def _run_discovery_phase(stem: str, static_analysis: dict) -> list:
     return findings
 
 
-def run_pipeline(contract_folder: str = None) -> list:
+def run_pipeline(contract_folder: str = None, function_filter: str = "") -> list:
     """Runs the full audit graph over a folder of .sol files and returns
-    a list of FindingSchema dicts (one per verified finding)."""
+    a list of FindingSchema dicts (one per verified finding).
+
+    function_filter: optional comma-separated function names restricting the
+    per-file fan-out (same semantics as GODEL_FUNCTIONS). A non-empty value
+    here takes precedence over the env var so the MCP can scope per request
+    without restarting the server process."""
     contract_folder = contract_folder or config.CONTRACTS_FOLDER
     if not contract_folder:
         raise SystemExit(
@@ -1202,10 +1229,11 @@ def run_pipeline(contract_folder: str = None) -> list:
             print(f"      [SCOPE] primary contract only — excluded {len(excluded)} "
                   f"function(s) from inlined libraries/interfaces/bases: {shown}")
 
-        # Optional targeted audit: GODEL_FUNCTIONS=name1,name2 restricts the
-        # fan-out to the listed functions (case-insensitive), keeping
-        # credit-sensitive runs surgical. Unknown names warn, never crash.
-        fn_filter = os.environ.get("GODEL_FUNCTIONS", "").strip()
+        # Optional targeted audit: restricts the fan-out to the listed
+        # functions (case-insensitive), keeping credit-sensitive runs surgical.
+        # Unknown names warn, never crash. A per-call function_filter (from the
+        # MCP) wins over the process-wide GODEL_FUNCTIONS env var.
+        fn_filter = (function_filter or "").strip() or os.environ.get("GODEL_FUNCTIONS", "").strip()
         if fn_filter:
             wanted = {n.strip().lower() for n in fn_filter.split(",") if n.strip()}
             selected = [f for f in functions if f["name"].lower() in wanted]
@@ -1213,7 +1241,8 @@ def run_pipeline(contract_folder: str = None) -> list:
             missing = sorted(wanted - matched)
             if missing:
                 print(f"      [TARGET] WARNING: not found in contract: {', '.join(missing)}")
-            print(f"      [TARGET] GODEL_FUNCTIONS filter active — auditing "
+            src = "argument" if (function_filter or "").strip() else "GODEL_FUNCTIONS"
+            print(f"      [TARGET] function filter active ({src}) — auditing "
                   f"{len(selected)}/{len(functions)} function(s): "
                   f"{', '.join(f['name'] for f in selected)}")
             functions = selected
@@ -1412,10 +1441,10 @@ def _drain_late_futures(future_to_func: dict, processed: set, stem: str, results
               f"within the drain cap — timeout placeholders kept")
 
 
-def _collect_future_result(future, func_name: str, stem: str, results: list):
-    """Extracts a finished graph result and appends findings. Shared by the
-    normal completion loop and the batch-timeout salvage path."""
-    final_state = future.result()
+def _collect_state_result(final_state: dict, stem: str, results: list):
+    """Converts a terminal graph state into result findings and appends them.
+    Shared by the per-function Future path and the MCP warm-seeded path (which
+    invokes the verifier subgraph directly, without a Future)."""
     focus_func = final_state.get('current_focus_function', 'unknown')
     bugs_found = len(final_state.get('verified_bugs', []))
 
@@ -1460,17 +1489,264 @@ def _collect_future_result(future, func_name: str, stem: str, results: list):
             results.append(_incomplete_finding(stem, focus_func, reason))
 
 
-def run_pipeline_code(contract_code: str, readme: str = "") -> list:
-    """Runs the pipeline on raw Solidity code (MCP/chat entry point).
-    Materializes the code into a temp folder, then delegates to run_pipeline."""
+def _collect_future_result(future, func_name: str, stem: str, results: list):
+    """Extracts a finished graph result and appends findings. Shared by the
+    normal completion loop and the batch-timeout salvage path."""
+    _collect_state_result(future.result(), stem, results)
+
+
+# A Solidity compilation unit must contain at least one top-level type decl.
+_CONTRACT_DECL_RE = re.compile(r"\b(?:abstract\s+contract|contract|library|interface)\s+\w+")
+
+
+def _autowrap_contract(code: str) -> str:
+    """Wrap a bare Solidity fragment (functions with no enclosing type) in a
+    minimal contract so solc + static analysis can run on it. Full compilation
+    units pass through untouched.
+
+    Limitation (by design): auto-wrap supplies only the missing OUTER decl. A
+    fragment that references external imports, base contracts, or undeclared
+    state still will not compile — that needs the real surrounding code."""
+    if not code or not code.strip():
+        return code
+    if _CONTRACT_DECL_RE.search(code):
+        return code
+    pragma, spdx, kept = "", "", []
+    for line in code.strip().splitlines():
+        s = line.strip()
+        if not pragma and s.startswith("pragma "):
+            pragma = s if s.endswith(";") else s + ";"
+            continue
+        if not spdx and s.startswith("// SPDX"):
+            spdx = s
+            continue
+        kept.append(line)
+    inner = "\n".join(kept).strip()
+    return "\n".join([
+        spdx or "// SPDX-License-Identifier: MIT",
+        pragma or "pragma solidity ^0.8.20;",
+        "",
+        "contract GodelTarget {",
+        inner,
+        "}",
+        "",
+    ])
+
+
+def _write_contract_files(tmpdir: str, contract_code: str, readme: str):
+    """Materialize code (+ optional readme) into tmpdir. Returns (sol_path,
+    final_code) where final_code is the auto-wrapped source actually written."""
+    code = _autowrap_contract(contract_code)
+    sol_path = os.path.join(tmpdir, "contract.sol")
+    with open(sol_path, "w", encoding="utf-8") as f:
+        f.write(code)
+    if readme:
+        with open(os.path.join(tmpdir, "README.md"), "w", encoding="utf-8") as f:
+            f.write(readme)
+    return sol_path, code
+
+
+def _adapt_prior_finding(raw, target: str = "", instructions: str = ""):
+    """Normalize a supplied finding into the INPUT shape the specifier consumes
+    (target_function/intent/constraint/relevant_code/severity_guess).
+
+    Accepts the OUTPUT shape produced by build_finding and saved as finding.json
+    (function/summary/root_cause/invariant/counterexample/severity), the INPUT
+    shape, a JSON string of either, or a bare string (treated as the intent).
+    `instructions` is folded into the intent as an auditor note so the verifier
+    re-confirms the human's exact hypothesis instead of re-guessing it.
+    Returns None when nothing usable can be extracted."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = {"intent": raw}
+    if not isinstance(raw, dict):
+        return None
+
+    func = str(raw.get("target_function") or raw.get("function") or target or "").strip()
+    intent = str(raw.get("intent") or raw.get("summary") or "").strip()
+    constraint = raw.get("constraint") or raw.get("root_cause") or ""
+    relevant = raw.get("relevant_code") or raw.get("invariant") or raw.get("isolated_code") or ""
+    severity = raw.get("severity_guess") or raw.get("severity") or "medium"
+
+    if not (intent or constraint or relevant):
+        return None
+
+    # An output finding demoted to informational carries the CAP, not the real
+    # severity. Reset it so a re-confirmed bug is not stuck at informational.
+    if str(severity).lower() in ("informational", "info"):
+        severity = "medium"
+
+    if instructions:
+        note = instructions.strip()
+        intent = (intent + "\n\n" if intent else "") + \
+            f"Auditor note / hypothesis to re-confirm: {note}"
+
+    finding = {
+        "target_function": func,
+        "severity_guess": severity,
+        "intent": intent,
+        "constraint": constraint,
+        "relevant_code": relevant,
+    }
+    cex = raw.get("counterexample")
+    if isinstance(cex, dict) and cex:
+        finding["counterexample"] = cex
+    return finding
+
+
+def _normalize_prior_findings(prior_findings) -> list:
+    """Coerce the prior_findings argument (None / dict / list / JSON string /
+    bare string) into a list of raw candidate items."""
+    if prior_findings is None:
+        return []
+    if isinstance(prior_findings, str):
+        s = prior_findings.strip()
+        if not s:
+            return []
+        try:
+            prior_findings = json.loads(s)
+        except Exception:
+            return [{"intent": s}]
+    if isinstance(prior_findings, dict):
+        return [prior_findings]
+    if isinstance(prior_findings, list):
+        return [p for p in prior_findings if isinstance(p, (dict, str))]
+    return []
+
+
+def _build_seeds(prior_findings, instructions: str = "", target: str = "") -> list:
+    """Builds the list of adapted seed findings for warm mode. Falls back to a
+    single finding synthesized from `instructions` when no prior_findings adapt
+    (warm-scoped mode: a free-form hypothesis with no formal finding)."""
+    seeds = []
+    for raw in _normalize_prior_findings(prior_findings):
+        adapted = _adapt_prior_finding(raw, target=target, instructions=instructions)
+        if adapted:
+            seeds.append(adapted)
+    if not seeds and instructions.strip():
+        seeds.append({
+            "target_function": (target or "").strip(),
+            "severity_guess": "medium",
+            "intent": f"Auditor-directed hypothesis to verify: {instructions.strip()}",
+            "constraint": "",
+            "relevant_code": "",
+        })
+    return seeds
+
+
+def _harness_for_target(static_analysis, target: str):
+    """Returns (single_harness, chain_harness) for a seed target. A '->' target
+    is a compositional chain; anything else is a single function. Non-fatal:
+    any failure yields (None, None) and the executor degrades to LLM encoding."""
+    if not static_analysis or not target:
+        return None, None
+    if "->" in target or "→" in target:
+        parts = [p.strip().split("(")[0].strip()
+                 for p in target.replace("→", "->").split("->")]
+        parts = [p for p in parts if p]
+        if len(parts) >= 2:
+            try:
+                from domain.semantics import HarnessEncoder
+                return None, HarnessEncoder(static_analysis).encode_function_sequence(parts)
+            except Exception as e:
+                logger.warning("[MCP-SEEDED] chain harness failed (non-fatal): %s", e)
+        return None, None
+    try:
+        return generate_harness(static_analysis, target), None
+    except Exception as e:
+        logger.warning("[MCP-SEEDED] harness failed for %s (non-fatal): %s", target, e)
+        return None, None
+
+
+def run_seeded_verification(contract_code: str, readme: str = "",
+                            seeds=None, target: str = "") -> list:
+    """Warm-seeded MCP path: re-confirm and fix SPECIFIC supplied findings
+    WITHOUT re-running discovery. Each seed is routed straight through the
+    specifier→executor→gatekeeper→fixer subgraph (bug_hunter skipped), so the
+    engine verifies the human's hypothesis instead of re-guessing it.
+
+    Returns the standard list of finding dicts. A seed that fails to verify
+    yields an honest unverified/incomplete/error artifact rather than vanishing;
+    a seed proven safe (UNSAT) legitimately yields nothing."""
+    seeds = seeds or []
+    if not seeds:
+        return []
+
+    results = []
+    with tempfile.TemporaryDirectory(prefix="godel_seed_") as tmpdir:
+        sol_path, raw_contract = _write_contract_files(tmpdir, contract_code, readme)
+        stem = Path(sol_path).stem
+
+        static_analysis = None
+        if not config.is_dry_run():
+            try:
+                static_analysis = abstract_contract(sol_path)
+            except Exception as e:
+                logger.warning("[MCP-SEEDED] static analysis failed (non-fatal): %s", e)
+            try:
+                warmup_rag()
+            except Exception as e:
+                logger.warning("[MCP-SEEDED] RAG warmup failed (non-fatal): %s", e)
+
+        try:
+            compiled = _build_verify_graph()
+        except Exception as e:
+            logger.error("[MCP-SEEDED] could not build verify graph: %s", e)
+            return [_error_finding(stem, target or "unknown", e)]
+
+        for idx, finding in enumerate(seeds, 1):
+            tgt = finding.get("target_function", "") or target
+            print(f"[MCP-SEEDED] Re-confirming seed {idx}/{len(seeds)}: "
+                  f"{tgt or 'contract-level'}")
+            harness, chain_harness = _harness_for_target(static_analysis, tgt)
+            initial_state = _build_seed_state(
+                finding, raw_contract, stem, readme, static_analysis,
+                harness=harness, chain_harness=chain_harness)
+            before = len(results)
+            try:
+                final_state = compiled.invoke(initial_state)
+                _collect_state_result(final_state, stem, results)
+                for r in results[before:]:
+                    r.setdefault("metadata", {})["source"] = "mcp_seeded"
+            except Exception as e:
+                logger.error("[MCP-SEEDED] verify failed for %s: %s", tgt, e)
+                results.append(_error_finding(stem, tgt or "unknown", e))
+    return results
+
+
+def run_pipeline_code(contract_code: str, readme: str = "", target: str = "",
+                      prior_findings=None, instructions: str = "") -> list:
+    """MCP/chat entry point. Chooses one of four modes from the optional args:
+
+    - warm-seeded : prior_findings given -> re-confirm/fix those exact findings
+                    (bug_hunter skipped; the supplied hypothesis is verified).
+    - warm-scoped : instructions but no usable prior_findings -> synthesize one
+                    seed finding from the auditor's hypothesis and verify it.
+    - cold-scoped : target only -> full discovery restricted to that function.
+    - cold-full   : nothing extra -> full discovery over the whole contract
+                    (the original behavior; existing 2-arg calls are unaffected).
+
+    Degrades warm->cold instead of crashing when the supplied findings are empty
+    or malformed. `target` scopes the cold fan-out per call (no server restart);
+    `instructions` is folded into every warm seed as an auditor note."""
+    target = (target or "").strip()
+    instructions = (instructions or "").strip()
+
+    seeds = _build_seeds(prior_findings, instructions, target)
+    if seeds:
+        print(f"[MCP] warm mode: {len(seeds)} seed finding(s) -> verifier subgraph "
+              f"(bug_hunter skipped)")
+        return run_seeded_verification(contract_code, readme, seeds, target)
+
+    if prior_findings or instructions:
+        print("[MCP] supplied findings/instructions yielded no usable seed — "
+              "falling back to cold discovery")
+
     with tempfile.TemporaryDirectory(prefix="godel_mcp_") as tmpdir:
-        src_path = os.path.join(tmpdir, "contract.sol")
-        with open(src_path, "w", encoding="utf-8") as f:
-            f.write(contract_code)
-        if readme:
-            with open(os.path.join(tmpdir, "README.md"), "w", encoding="utf-8") as f:
-                f.write(readme)
-        return run_pipeline(tmpdir)
+        _write_contract_files(tmpdir, contract_code, readme)
+        return run_pipeline(tmpdir, function_filter=target)
 
 
 # ==========================================
