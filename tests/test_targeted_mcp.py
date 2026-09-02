@@ -10,6 +10,7 @@ import json
 import pytest
 
 from domain import pipeline
+from domain import config, rag
 from domain.pipeline import (
     _adapt_prior_finding,
     _autowrap_contract,
@@ -251,3 +252,110 @@ class TestDispatch:
         out = run_pipeline_code(FULL_CONTRACT, "some readme")
         assert out == ["COLD"]
         assert record["cold"][0]["function_filter"] == ""
+
+
+# ===========================================================================
+# G. RAG disable flag: MCP skips the ~26s model warmup + retrieval entirely
+# ===========================================================================
+class TestRagDisableFlag:
+    def test_enabled_by_default(self, monkeypatch):
+        monkeypatch.delenv("GODEL_DISABLE_RAG", raising=False)
+        assert config.rag_enabled() is True
+
+    @pytest.mark.parametrize("val", ["1", "true", "True"])
+    def test_disabled_values(self, monkeypatch, val):
+        monkeypatch.setenv("GODEL_DISABLE_RAG", val)
+        assert config.rag_enabled() is False
+
+    def test_zero_keeps_rag_on(self, monkeypatch):
+        monkeypatch.setenv("GODEL_DISABLE_RAG", "0")
+        assert config.rag_enabled() is True
+
+    def test_warmup_skipped_when_disabled(self, monkeypatch):
+        monkeypatch.setenv("GODEL_DISABLE_RAG", "1")
+        import Infrastructure.postgres as pg
+        calls = {"ce": 0, "embed": 0}
+        monkeypatch.setattr(pg, "_get_cross_encoder",
+                            lambda: calls.__setitem__("ce", calls["ce"] + 1))
+        monkeypatch.setattr(pg, "embed",
+                            lambda t: calls.__setitem__("embed", calls["embed"] + 1))
+        pg.warmup_rag()
+        assert calls == {"ce": 0, "embed": 0}
+
+    def test_warmup_runs_when_enabled(self, monkeypatch):
+        monkeypatch.delenv("GODEL_DISABLE_RAG", raising=False)
+        import Infrastructure.postgres as pg
+        calls = {"ce": 0, "embed": 0}
+        monkeypatch.setattr(pg, "_get_cross_encoder",
+                            lambda: calls.__setitem__("ce", calls["ce"] + 1))
+        monkeypatch.setattr(pg, "embed",
+                            lambda t: calls.__setitem__("embed", calls["embed"] + 1))
+        pg.warmup_rag()
+        assert calls["ce"] == 1 and calls["embed"] == 1
+
+    def test_specifier_retrieval_short_circuits(self, monkeypatch):
+        monkeypatch.setenv("GODEL_DISABLE_RAG", "1")
+        findings, diag = rag.retrieve_findings_for_specifier({"target_function": "deposit"})
+        assert findings == []
+        assert diag.get("disabled") == "GODEL_DISABLE_RAG"
+
+    def test_hunter_retrieval_short_circuits(self, monkeypatch):
+        monkeypatch.setenv("GODEL_DISABLE_RAG", "1")
+        findings, diag = rag.retrieve_findings_for_hunter("deposit", "contract X {}")
+        assert findings == []
+        assert diag.get("disabled") == "GODEL_DISABLE_RAG"
+
+
+# ===========================================================================
+# H. Seeded dry-run safety: the verify graph enters at specifier (NOT dry-
+#    mocked), so dry-run must short-circuit before invoke or it makes LIVE
+#    LLM calls. Regression guard for the warm-seeded MCP path.
+# ===========================================================================
+class TestSeededDryRun:
+    SEED = {"target_function": "deposit", "severity_guess": "medium",
+            "intent": "zero-share mint", "constraint": "", "relevant_code": ""}
+
+    class FakeCompiled:
+        def __init__(self, counter):
+            self._counter = counter
+
+        def get_graph(self):
+            class G:
+                nodes = {"__start__", "__end__", "specifier", "executor",
+                         "gatekeeper", "fixer"}
+            return G()
+
+        def invoke(self, state):
+            self._counter["n"] += 1
+            return {**state, "verified_bugs": [], "z3_result": {"status": "unsat"},
+                    "current_focus_function": "deposit"}
+
+    def test_dry_run_does_not_invoke_graph(self, monkeypatch):
+        monkeypatch.setenv("GODEL_DRY_RUN", "1")
+        monkeypatch.setenv("GODEL_DISABLE_RAG", "1")
+        counter = {"n": 0}
+        monkeypatch.setattr(pipeline, "_build_verify_graph",
+                            lambda: self.FakeCompiled(counter))
+        res = pipeline.run_seeded_verification(
+            FULL_CONTRACT, "", seeds=[dict(self.SEED)], target="deposit")
+        assert counter["n"] == 0, "dry-run MUST NOT invoke the verify graph (live LLM calls)"
+        assert len(res) == 1
+        assert res[0]["qc_status"] == "dry_run_plumbing"
+        assert res[0]["metadata"]["source"] == "mcp_seeded"
+
+    def test_live_run_invokes_graph(self, monkeypatch):
+        monkeypatch.delenv("GODEL_DRY_RUN", raising=False)
+        monkeypatch.setenv("GODEL_DISABLE_RAG", "1")
+        counter = {"n": 0}
+        monkeypatch.setattr(pipeline, "_build_verify_graph",
+                            lambda: self.FakeCompiled(counter))
+        # Keep it hermetic/fast: no slither, no ollama, no harness, no collector.
+        monkeypatch.setattr(pipeline, "abstract_contract",
+                            lambda p: {"contract": "MiniVault", "functions": []})
+        monkeypatch.setattr(pipeline, "warmup_rag", lambda: None)
+        monkeypatch.setattr(pipeline, "_harness_for_target", lambda sa, t: (None, None))
+        monkeypatch.setattr(pipeline, "_collect_state_result",
+                            lambda fs, stem, results: None)
+        pipeline.run_seeded_verification(
+            FULL_CONTRACT, "", seeds=[dict(self.SEED)], target="deposit")
+        assert counter["n"] == 1, "a live run MUST invoke the verify graph"

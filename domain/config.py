@@ -160,6 +160,16 @@ def is_dry_run() -> bool:
     return os.environ.get("GODEL_DRY_RUN", "0") in ("1", "true", "True")
 
 
+def rag_enabled() -> bool:
+    """Whether RAG grounding (ollama embeddings + cross-encoder rerank) runs.
+    The stack is a ~26s cold load that CPU-offloads on <12GB GPUs and is
+    reloaded after ollama's ~4-min keep-alive eviction; it only enriches
+    DISCOVERY with historical findings. Set GODEL_DISABLE_RAG=1 to skip it —
+    the MCP server defaults it on, because a targeted re-confirm already
+    supplies the finding, so retrieval adds cost without changing the verdict."""
+    return os.environ.get("GODEL_DISABLE_RAG", "0") not in ("1", "true", "True")
+
+
 def setup_logging(level: str = None):
     """Two-tier logging: WARNING+ on the console (clean CI terminal), EVERYTHING
     to OUTPUT_DIR/godel-run-full.log (the noise tier persisted to the DB)."""

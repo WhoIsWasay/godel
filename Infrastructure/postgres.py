@@ -174,6 +174,10 @@ def warmup_rag():
     RAG call: ~21.8s HuggingFace download + ~14s Ollama VRAM load. Called once
     from run_pipeline() before any function graph spawns. Non-fatal: if models
     fail to load (e.g. CUDA OOM), the audit continues without RAG grounding."""
+    from domain import config
+    if not config.rag_enabled():
+        _raglog("RAG disabled (GODEL_DISABLE_RAG) — skipping model warmup")
+        return
     t0 = time.time()
     _raglog("Warming up RAG models...")
     try:

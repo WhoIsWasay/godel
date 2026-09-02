@@ -26,6 +26,14 @@ import sys
 # Make the repo root importable regardless of the working directory.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# MCP = targeted re-confirm/audit, so skip the RAG stack by default. warmup_rag()
+# otherwise spends ~26s cold-loading qwen3-embedding:8b (4.7GB -> 7.2GB, CPU-
+# offloaded on <12GB GPUs) BEFORE any verification work; when the MCP client's
+# request timeout is shorter, it kills the call mid-load and ollama keeps loading
+# as an orphan (the "VRAM fills after I kill it" symptom). setdefault so an
+# opencode `environment` override (GODEL_DISABLE_RAG=0) can turn RAG back on.
+os.environ.setdefault("GODEL_DISABLE_RAG", "1")
+
 from contextlib import contextmanager
 
 from fastmcp import FastMCP

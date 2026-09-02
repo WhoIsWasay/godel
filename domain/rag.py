@@ -198,6 +198,9 @@ def retrieve_findings_for_specifier(finding: dict,
     Diagnostics contains scores + P@K for terminal logging and future
     aggregation (precision logger).
     """
+    from domain import config
+    if not config.rag_enabled():
+        return [], {"disabled": "GODEL_DISABLE_RAG", "elapsed": 0.0}
     t0 = time.time()
     _raglog("=" * 72)
     _raglog(f"SPECIFIER RAG RETRIEVAL for function: {finding.get('target_function')}")
@@ -273,6 +276,9 @@ def retrieve_findings_for_hunter(function_name: str,
     and contract code excerpt, retrieves historical vulnerability patterns.
     Returns (formatted_findings, diagnostics).
     """
+    from domain import config
+    if not config.rag_enabled():
+        return [], {"disabled": "GODEL_DISABLE_RAG", "elapsed": 0.0}
     t0 = time.time()
     _raglog("=" * 72)
     _raglog(f"HUNTER RAG RETRIEVAL for function: {function_name}")

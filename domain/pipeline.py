@@ -767,6 +767,22 @@ def _incomplete_finding(contract_name: str, func_name: str, reason: str) -> dict
     )
 
 
+def _dry_run_finding(contract_name: str, func_name: str) -> dict:
+    """Visible artifact for a DRY-RUN seeded verification. The verify graph
+    enters at specifier (bug_hunter skipped) and only bug_hunter is dry-mocked,
+    so invoking the graph would make LIVE LLM calls. In dry-run we validate the
+    seeded plumbing (seed adapted -> harness -> verify graph compiled -> seed
+    state built) and stop here: zero LLM calls, zero credits, no verdict."""
+    return build_finding(
+        {"target_function": func_name, "severity_guess": "info",
+         "intent": "Dry-run: seeded plumbing validated (seed + harness + verify "
+                   "graph compiled). LLM nodes NOT invoked — no verification "
+                   "performed and no credits spent."},
+        {"contract_name": contract_name, "z3_code": "", "z3_result": None, "iterations": 0},
+        "", "", "", "dry_run_plumbing",
+    )
+
+
 def _should_flag_incomplete(final_state: dict) -> str | None:
     """Returns a human-readable reason string when the terminal graph state
     represents an aborted/incomplete analysis rather than a genuine verdict,
@@ -1704,6 +1720,16 @@ def run_seeded_verification(contract_code: str, readme: str = "",
             initial_state = _build_seed_state(
                 finding, raw_contract, stem, readme, static_analysis,
                 harness=harness, chain_harness=chain_harness)
+            if config.is_dry_run():
+                # The verify graph enters at specifier and only bug_hunter is
+                # dry-mocked, so invoking it here would make LIVE LLM calls.
+                # Validate the seeded plumbing and stop: zero credits, no verdict.
+                print(f"  [MCP-SEEDED] {tgt or 'contract-level'}: dry-run plumbing OK "
+                      f"(seed + harness + verify-graph built; LLM nodes NOT invoked)")
+                dry = _dry_run_finding(stem, tgt or "unknown")
+                dry.setdefault("metadata", {})["source"] = "mcp_seeded"
+                results.append(dry)
+                continue
             before = len(results)
             try:
                 final_state = compiled.invoke(initial_state)
