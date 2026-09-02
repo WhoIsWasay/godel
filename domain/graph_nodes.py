@@ -427,8 +427,33 @@ def executor_node(state: GraphState, cegis_tool: CEGIS):
     
     z3_code = state.get("z3_code", "")
     if not z3_code:
+        # The specifier produced no property: a blank LLM response with no
+        # [SUPERVISOR_ALERT] (an alert is routed to the supervisor and never
+        # reaches here). The old early-return set ONLY supervisor_critique +
+        # messages — no z3_result, no counter increment — so route_after_executor
+        # saw status=None, fell through to "specifier", and neither `iterations`
+        # nor `executor_runs` ever advanced: an unbounded specifier->executor->
+        # specifier loop stopped only by LangGraph's recursion_limit
+        # (GraphRecursionError). That is exactly why the MCP seeded run reported
+        # iterations=0 / analysis_incomplete. Mark it an error and count the
+        # wasted round so route_after_executor's EXECUTOR_MAX_ITERATIONS bound
+        # terminates it and the specifier gets bounded repair retries. Prefixing
+        # the critique as executor feedback makes route_after_specifier send the
+        # retry straight back to the executor (and specifier_node passes it on as
+        # repair_feedback). This also closes the same latent loop in the main graph.
         return {
-            "supervisor_critique": "No Z3 code was provided to the executor.",
+            "z3_result": {
+                "status": "error",
+                "error": "No Z3 code was provided to the executor.",
+                "output": "",
+            },
+            "supervisor_critique": (
+                "Z3 Syntax/Execution Error: No Z3 code was provided to the "
+                "executor — the property script was empty. Regenerate a complete, "
+                "runnable Z3 script that encodes the finding."
+            ),
+            "iterations": state.get("iterations", 0) + 1,
+            "executor_runs": state.get("executor_runs", 0) + 1,
             "messages": [AIMessage(content="[EXECUTOR]: Failed. Missing Z3 code.")]
         }
 

@@ -886,9 +886,17 @@ def _build_verify_graph():
     verify_graph.add_node("gatekeeper", node_gatekeeper)
     verify_graph.add_node("fixer", node_fixer)
 
+    # The "supervisor" route means "this needs discovery-level re-examination"
+    # (in practice: the specifier emitted [SUPERVISOR_ALERT] because the property
+    # is inexpressible with the harness symbols). This subgraph has NO supervisor
+    # or bug_hunter to escalate to, so aliasing it back to "specifier" re-runs the
+    # same specifier on the same seed+harness forever — no counter advances, so
+    # only LangGraph's recursion_limit stops it (GraphRecursionError -> the MCP
+    # seeded run reports a crash / analysis_incomplete). Terminate honestly at END
+    # instead; _collect_state_result surfaces the unprocessed finding as incomplete.
     verify_graph.add_conditional_edges(
         "specifier", route_after_specifier,
-        {"executor": "executor", "supervisor": "specifier"})
+        {"executor": "executor", "supervisor": END})
     verify_graph.add_conditional_edges(
         "executor", route_after_executor,
         {"specifier": "specifier", "gatekeeper": "gatekeeper", END: END})

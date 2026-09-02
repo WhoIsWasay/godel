@@ -182,6 +182,56 @@ class TestVerifyGraph:
         for forbidden in ("bug_hunter", "supervisor"):
             assert forbidden not in nodes
 
+    # --- Regression: the seeded subgraph must TERMINATE, not recurse forever ---
+    # opencode hit an abort that surfaced as analysis_incomplete / iterations=0:
+    # the specifier returned empty z3_code and the graph spun an unbounded loop
+    # stopped only by GraphRecursionError. Two variants, both LLM-free — only
+    # node_specifier is mocked (a 1-arg callable, matching how LangGraph invokes
+    # a node). node_executor stays REAL in Variant 2 so its bounded empty-code
+    # path is exercised; it early-returns before touching `cegis`, so no
+    # network/LLM cost. recursion_limit is set well ABOVE the natural termination
+    # to prove the graph RETURNS on its own rather than being cut off.
+
+    SEED = {"target_function": "deposit", "severity_guess": "medium",
+            "intent": "assets>0 => shares>0 (Anti-Dilution)",
+            "constraint": "shares = (assets*totalSupply)/totalAssets",
+            "relevant_code": "function deposit(uint256 assets) external {}"}
+
+    def _seed_state(self):
+        return pipeline._build_seed_state(
+            dict(self.SEED), "contract MiniVault {}", "MiniVault", "",
+            {"contract": "MiniVault", "functions": []},
+            harness=None, chain_harness=None)
+
+    def test_supervisor_alert_terminates_at_end(self, monkeypatch):
+        # Variant 1: [SUPERVISOR_ALERT] -> route_after_specifier returns
+        # "supervisor". The verify graph has no supervisor, so that route must map
+        # to END (honest incomplete) instead of aliasing back to "specifier".
+        monkeypatch.setattr(
+            pipeline, "node_specifier",
+            lambda state: {"supervisor_critique": "[SUPERVISOR_ALERT] cannot express",
+                           "z3_code": "", "messages": []})
+        compiled = _build_verify_graph()
+        final = compiled.invoke(self._seed_state(), config={"recursion_limit": 25})
+        assert final.get("executor_runs", 0) == 0          # executor never reached
+        assert (final.get("z3_result") or {}).get("status") is None
+        assert len(final.get("findings") or []) == 1       # seed left queued
+        assert pipeline._should_flag_incomplete(final)     # honest incomplete artifact
+
+    def test_blank_z3_code_terminates_at_executor_bound(self, monkeypatch):
+        # Variant 2: blank z3_code with no alert -> executor early-return must set
+        # z3_result status + increment executor_runs so route_after_executor's
+        # EXECUTOR_MAX_ITERATIONS bound ends the loop (was unbounded before).
+        monkeypatch.setattr(
+            pipeline, "node_specifier",
+            lambda state: {"z3_code": "", "messages": []})
+        compiled = _build_verify_graph()
+        final = compiled.invoke(self._seed_state(), config={"recursion_limit": 50})
+        assert final.get("executor_runs") == config.EXECUTOR_MAX_ITERATIONS
+        assert (final.get("z3_result") or {}).get("status") == "error"
+        assert len(final.get("findings") or []) == 1
+        assert pipeline._should_flag_incomplete(final)
+
 
 # ===========================================================================
 # F. Dispatcher routing: which mode fires for which arguments (LLM-free)
