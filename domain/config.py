@@ -143,6 +143,26 @@ WITNESS_MINIMIZE_BOUNDS = tuple(
 # it are already realistic and skip the extra (LLM-free) re-solves.
 WITNESS_GROUNDABLE_MAX = int(os.environ.get("GODEL_WITNESS_GROUNDABLE_MAX", 10**18))
 
+# Z3 TIMEOUT RESCUE (decidability). An unbounded nonlinear integer property —
+# mul/div of two uint256 symbols, e.g. `shares = (assets*totalSupply)/totalAssets`
+# — can exceed Z3_TIMEOUT_SECONDS with no verdict: Z3 cannot decide nonlinear
+# integer arithmetic in general. Re-solving the SAME harness-composed script with
+# every symbol capped to [0, B] (build_model(witness_bound=B)) makes the domain
+# finite, so it terminates. This is what stopped the seeded MiniVault deposit
+# re-confirm: the specifier's property timed out at 30s, CEGIS burned LLM repairs
+# that ALSO timed out, and the run aborted as analysis_incomplete after ~6 min.
+# Tight->loose; the first SAT wins. A bounded SAT is a valid witness (only
+# `sym <= B` was ADDED to the same property). A bounded UNSAT is NOT a safety
+# proof — the violation may need larger magnitude — so only SAT is ever accepted;
+# UNSAT/error fall through to the normal repair path. Starts small so a common
+# small-witness bug (deposit: assets=1, totalSupply=1, totalAssets=1000) resolves
+# on the first rung. Deterministic: no LLM call.
+WITNESS_TIMEOUT_BOUNDS = tuple(
+    int(x) for x in os.environ.get(
+        "GODEL_WITNESS_TIMEOUT_BOUNDS", "65536,1000000,1000000000,1000000000000"
+    ).split(",") if x.strip().isdigit()
+)
+
 # ==========================================
 # LLM RETRY
 # ==========================================

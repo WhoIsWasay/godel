@@ -204,6 +204,79 @@ def test_minimize_falls_back_when_only_huge_witness():
     assert all(a["status"] == "unsat" for a in attempts)
 
 
+# ------------------------------------------- Part 3: Z3-timeout rescue ladder
+def test_timeout_bound_rescues_unbounded_timeout():
+    """An unbounded nonlinear property times out; capping the harness symbols
+    makes it decidable and the FIRST rung yields a SAT witness — no LLM repair."""
+    calls = []
+
+    def _fake(code):
+        calls.append(code)
+        if "witness_bound=" in code:
+            return {"status": "sat", "output": "BUG FOUND: [a_assets = 1]",
+                    "z3_code": code}
+        return {"status": "error", "output": None,
+                "error": "Z3 timeout (30.0s)", "z3_code": code}
+
+    ceg = CEGIS(agent=None, run_z3_tool=_fake)
+    composed = compose_script(_harness(), DEPOSIT_PROPERTY)
+    attempts = []
+    out = ceg._retry_with_witness_bound(composed, attempts)
+    assert out is not None and out["status"] == "sat"
+    assert out["timeout_bounded"] is True
+    assert out["witness_bound"] == config.WITNESS_TIMEOUT_BOUNDS[0]
+    # only the first (smallest) rung was needed before SAT
+    assert len(calls) == 1 and "witness_bound=" in calls[0]
+    assert attempts and attempts[0]["phase"] == "timeout_bound"
+
+
+def test_timeout_bound_noop_without_build_model():
+    """A standalone / LLM-improvised script has no build_model hook to inject
+    into -> None, and no Z3 re-solve is attempted."""
+    calls = []
+    ceg = CEGIS(agent=None, run_z3_tool=lambda c: calls.append(c) or {"status": "sat"})
+    out = ceg._retry_with_witness_bound("from z3 import *\nsolver = Solver()", [])
+    assert out is None
+    assert calls == []
+
+
+def test_timeout_bound_returns_none_when_all_rungs_unsat():
+    """Overflow-class bug: every bounded rung is UNSAT. A bounded UNSAT is NOT a
+    safety proof (the violation may need magnitude above the cap), so None is
+    returned to fall through — a verdict is never fabricated."""
+    ceg = CEGIS(agent=None, run_z3_tool=lambda c: run_z3(c, strict=True))
+    composed = compose_script(_harness(), OVERFLOW_PROPERTY)
+    attempts = []
+    out = ceg._retry_with_witness_bound(composed, attempts)
+    assert out is None
+    assert len(attempts) == len(config.WITNESS_TIMEOUT_BOUNDS)
+    assert all(a["status"] == "unsat" for a in attempts)
+
+
+def test_run_with_repair_timeout_rescued_without_llm(monkeypatch, tmp_path):
+    """End-to-end: the initial run times out, the witness-bound rescue finds a
+    SAT, and run_with_repair returns it WITHOUT spending any LLM repair. agent is
+    None, so had the loop fallen through to _repair_script it would have returned
+    no code and the result would have stayed an error — proving the rescue path."""
+    monkeypatch.setattr(config, "DEBUG_FOLDER", tmp_path)
+    calls = []
+
+    def _fake(code):
+        calls.append(code)
+        if "witness_bound=" in code:
+            return {"status": "sat", "output": "BUG FOUND: [a_assets = 1]",
+                    "z3_code": code}
+        return {"status": "error", "output": None,
+                "error": "Z3 timeout (30.0s)", "z3_code": code}
+
+    ceg = CEGIS(agent=None, run_z3_tool=_fake)
+    composed = compose_script(_harness(), DEPOSIT_PROPERTY)
+    res = ceg.run_with_repair(composed, focus_function="deposit")
+    assert res["status"] == "sat"
+    assert res["repairs_used"] == 0                 # no LLM repair spent
+    assert any("witness_bound=" in c for c in calls)  # bounded re-solve ran
+
+
 # ------------------------------------------------------- Part 1: executor glue
 def test_executor_composes_harness_before_running():
     from domain.graph_nodes import executor_node

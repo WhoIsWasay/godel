@@ -76,6 +76,17 @@ class CEGIS:
         attempts.append({"phase": "run", "status": result.get("status"),
                          "error": result.get("error")})
 
+        # A Z3 timeout on an unbounded nonlinear property never resolves by
+        # rewriting it — every LLM repair re-runs a still-unbounded script that
+        # times out again (this spun the seeded deposit re-confirm through ~6 min
+        # of 30s timeouts to analysis_incomplete). Bound the harness symbols and
+        # re-solve deterministically BEFORE spending the repair budget.
+        if result.get("status") == "error" and "timeout" in (result.get("error") or "").lower():
+            bounded = self._retry_with_witness_bound(z3_code, attempts)
+            if bounded is not None:
+                z3_code = bounded.get("z3_code") or z3_code
+                result = bounded
+
         repairs = 0          # LLM repairs (bounded by max_repairs)
         deterministic = 0    # LLM-free NameError fixes (bounded too)
         while result.get("status") == "error" and repairs < max_repairs:
@@ -106,6 +117,14 @@ class CEGIS:
             attempts.append({"phase": "repair", "kind": kind,
                              "status": result.get("status"),
                              "error": result.get("error")})
+            # An LLM repair can hand back a still-unbounded nonlinear property
+            # that times out again. Bound + re-solve deterministically before the
+            # next repair so a decidable witness is found without burning budget.
+            if result.get("status") == "error" and "timeout" in (result.get("error") or "").lower():
+                bounded = self._retry_with_witness_bound(z3_code, attempts)
+                if bounded is not None:
+                    z3_code = bounded.get("z3_code") or z3_code
+                    result = bounded
 
         result["repairs_used"] = repairs
         result["deterministic_repairs"] = deterministic
@@ -127,6 +146,46 @@ class CEGIS:
         return result
 
     # ------------------------------------------------------------ internals
+    def _retry_with_witness_bound(self, z3_code: str, attempts: list) -> dict | None:
+        """Deterministically rescue a Z3 TIMEOUT on an unbounded nonlinear
+        property by re-solving the SAME harness-composed script with every uint256
+        symbol additionally capped to [0, B].
+
+        Why: Z3 cannot decide nonlinear integer arithmetic (mul/div of two
+        symbols, e.g. `shares = (assets*totalSupply)/totalAssets`) in general, so
+        an unbounded property can hit Z3_TIMEOUT_SECONDS with no verdict. Bounding
+        the domain makes it finite and decidable, so it terminates. Without this
+        the repair loop just re-runs a still-unbounded script that times out again
+        — exactly what spun the seeded MiniVault deposit re-confirm to
+        analysis_incomplete after ~6 minutes of 30s timeouts.
+
+        Soundness: each rung only ADDS `sym <= B` to the identical property, so a
+        bounded SAT is a valid witness (the concrete Forge PoC remains the final
+        ground-truth check). A bounded UNSAT is NOT a safety proof — the violation
+        may need magnitude above B — so only SAT is ever returned; UNSAT/error
+        loosen the bound and, failing that, return None to fall through to the
+        normal LLM repair path. No LLM call."""
+        if "build_model(" not in z3_code:
+            return None  # standalone / LLM-improvised script: no bound hook
+        for bound in config.WITNESS_TIMEOUT_BOUNDS:
+            bounded_code = _inject_witness_bound(z3_code, bound)
+            if bounded_code == z3_code:
+                return None  # no zero-arg call site to inject into
+            attempt = self.run_z3(bounded_code)
+            status = attempt.get("status")
+            attempts.append({"phase": "timeout_bound", "witness_bound": bound,
+                             "status": status, "error": attempt.get("error")})
+            if status == "sat":
+                attempt["timeout_bounded"] = True
+                attempt["witness_bound"] = bound
+                print(f"      [CEGIS] Z3 timeout resolved with witness_bound <= {bound} "
+                      f"— bounded nonlinear problem is decidable; SAT witness found "
+                      f"(no LLM repair)")
+                return attempt
+        print("      [CEGIS] witness-bounded re-solves found no SAT — falling "
+              "back to guided repair")
+        return None
+
     def _minimize_witness(self, z3_code: str, cex: dict, attempts: list) -> dict | None:
         """Shrinks a huge SAT witness to a Forge-groundable size, soundly.
 
