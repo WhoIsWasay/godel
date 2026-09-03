@@ -79,6 +79,13 @@ def build_finding(finding, state, fixed_code, test_suite, forge_output, qc_statu
     z3_result = state.get("z3_result") or {}
     z3_output = z3_result.get("output") if z3_result.get("status") == "sat" else None
     counterexample = OutputExtractor.parse_z3_counterexample(z3_output) if z3_output else {}
+    if not counterexample:
+        # Forge-direct seeded path: Z3 never produced a witness (nonlinear timeout),
+        # but the human supplied one. Keep it so the artifact reports the values the
+        # PoC was actually built from instead of an empty counterexample.
+        supplied = finding.get("counterexample")
+        if isinstance(supplied, dict) and supplied:
+            counterexample = supplied
     counterexample = normalize_counterexample(counterexample)
 
     rag_diag = state.get("rag_diagnostics") or {}

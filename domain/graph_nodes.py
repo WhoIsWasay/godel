@@ -598,18 +598,35 @@ def executor_node(state: GraphState, cegis_tool: CEGIS):
         updates["messages"] = [AIMessage(
             content="[EXECUTOR]: VACUOUS — over-constrained base model. Regenerating property.")]
     elif result.get("z3_timeout"):
-        # Undecidable/slow nonlinear property — terminal INCONCLUSIVE. The router
-        # ENDs on z3_timeout, so this critique is never fed back for regeneration;
-        # it exists only so logs/artifacts describe the outcome honestly (a timeout
-        # is NOT a syntax error and no rewrite can fix it).
-        updates["supervisor_critique"] = (
-            "Z3 TIMEOUT: the property is nonlinear integer arithmetic that Z3 could "
-            "not decide within the timeout, even after bounding the witness domain. "
-            "INCONCLUSIVE — neither proven safe nor confirmed."
-        )
-        updates["messages"] = [AIMessage(
-            content="[EXECUTOR]: Z3 TIMEOUT — inconclusive; ending without a futile "
-                    "specifier regeneration or LLM repair.")]
+        # Undecidable/slow nonlinear property. The router ENDs on z3_timeout
+        # UNLESS the queued finding carries a concrete witness — then it routes
+        # to the Forge gatekeeper (ground truth) instead. When such a witness
+        # exists, populate bug_report so the gatekeeper's artifact (which snapshots
+        # state["bug_report"]) records the values the EVM PoC was built from rather
+        # than an empty report. This critique is never fed back for regeneration; a
+        # timeout is NOT a syntax error and no rewrite can fix it.
+        finding = (state.get("findings") or [{}])[0]
+        cex = finding.get("counterexample")
+        if isinstance(cex, dict) and cex:
+            cex_txt = ", ".join(f"{k}={v}" for k, v in sorted(cex.items(), key=lambda kv: str(kv[0])))
+            updates["bug_report"] = (
+                "[Z3 TIMEOUT — Forge-direct rescue] Z3 could not decide the nonlinear "
+                f"property, but a concrete witness was supplied: {cex_txt}. Routing to "
+                "the Foundry gatekeeper to confirm/deny on the real EVM."
+            )
+            updates["supervisor_critique"] = None
+            updates["messages"] = [AIMessage(
+                content="[EXECUTOR]: Z3 TIMEOUT with a supplied witness — passing the "
+                        "concrete values to the gatekeeper for EVM confirmation.")]
+        else:
+            updates["supervisor_critique"] = (
+                "Z3 TIMEOUT: the property is nonlinear integer arithmetic that Z3 could "
+                "not decide within the timeout, even after bounding the witness domain. "
+                "INCONCLUSIVE — neither proven safe nor confirmed."
+            )
+            updates["messages"] = [AIMessage(
+                content="[EXECUTOR]: Z3 TIMEOUT — inconclusive; ending without a futile "
+                        "specifier regeneration or LLM repair.")]
     else:
         updates["supervisor_critique"] = f"Z3 Syntax/Execution Error:\n{result['error']}"
         updates["messages"] = [AIMessage(content="[EXECUTOR]: ERROR during execution. Needs refinement.")]

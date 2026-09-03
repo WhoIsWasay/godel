@@ -110,6 +110,18 @@ class PropertyVerifierAgent:
             raw_report = result_state.get("bug_report", "")
             facts = str(OutputExtractor.parse_slither_json(raw_report, func_name))
 
+            # Forge-direct seeded path: when Z3 is inconclusive (nonlinear timeout)
+            # the human-supplied witness is the ONLY concrete values we have, and it
+            # lives on the finding, not on z3_result. Surface it so the PoC pins these
+            # exact values. When Z3 DID emit a SAT witness above it is authoritative,
+            # so we deliberately do NOT append the supplied one (they could conflict).
+            seed_cex = finding.get("counterexample")
+            if isinstance(seed_cex, dict) and seed_cex:
+                facts += ("\nCONCRETE COUNTEREXAMPLE (supplied witness — use these EXACT "
+                          "values, reaching the required state through real calls where "
+                          "possible): "
+                          + ", ".join(f"{k}={v}" for k, v in sorted(seed_cex.items(), key=lambda kv: str(kv[0]))))
+
         legacy = needs_legacy_harness(contract_code)
         legacy_block = legacy_generation_directive(contract_code) if legacy else ""
 

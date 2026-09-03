@@ -614,8 +614,19 @@ def route_after_executor(state: GraphState) -> str:
         # retry burns a ~2.5-min LLM call plus more 30s timeouts. Left as a
         # generic "error" below, the router would re-queue it up to
         # EXECUTOR_MAX_ITERATIONS times — that outer loop is what ran the seeded
-        # MiniVault deposit re-confirm for ~an hour. End now; _collect_state_result
-        # surfaces an honest incomplete artifact for the still-queued finding.
+        # MiniVault deposit re-confirm for ~an hour.
+        #
+        # FORGE-DIRECT RESCUE: a timeout means Z3 could not DECIDE the property,
+        # NOT that the bug is absent. If the queued finding carries a concrete
+        # witness (a warm-seeded re-confirm's human-supplied counterexample, or a
+        # machine-found one), the Foundry gatekeeper is the ground truth and can
+        # still confirm/deny it on the real EVM — so route there instead of
+        # abandoning the finding to an incomplete artifact. Only END when there is
+        # no witness to test.
+        finding = (state.get("findings") or [{}])[0]
+        cex = finding.get("counterexample")
+        if isinstance(cex, dict) and cex:
+            return "gatekeeper"
         return END
     # A vacuous UNSAT reads status="unsat" but is NOT a verdict — the vacuity
     # probe found the base model over-constrained, so nothing was proven. The
