@@ -73,6 +73,10 @@ def _smoke():
 
         props = tools["audit_contract"]["inputSchema"]["properties"]
         assert "contract_code" in props and "readme" in props, sorted(props)
+        # The injected FastMCP Context is server-side only; it must never leak
+        # into the advertised input schema (regression guard for the async
+        # keep-alive rewrite).
+        assert "ctx" not in props, sorted(props)
         return tools
     finally:
         proc.terminate()

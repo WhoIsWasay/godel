@@ -22,6 +22,7 @@ Register in opencode.json (project or global):
 
 import os
 import sys
+import time
 
 # Make the repo root importable regardless of the working directory.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -36,39 +37,160 @@ os.environ.setdefault("GODEL_DISABLE_RAG", "1")
 
 from contextlib import contextmanager
 
-from fastmcp import FastMCP
+import anyio
+from fastmcp import Context, FastMCP
+
+from domain import config
+
+# Import the pipeline at MODULE TOP (main thread), NOT lazily inside the tool's
+# worker thread. domain.pipeline transitively imports numpy (whose C-extension
+# loader deadlocks on Windows when first imported from a non-main thread while
+# the asyncio event loop is running — it hung the worker for 90s+ and the tool
+# never returned). Loading it here, once, on the main thread during startup
+# avoids that entirely; the ~4s cost is paid before the initialize handshake
+# and every later import is a cached no-op.
 from domain.pipeline import run_pipeline_code
 
 mcp = FastMCP("godel")
 
 
+class _StderrSink:
+    """File-like that forwards writes to stderr, leaving fd 1 (the JSON-RPC
+    channel) pristine. `__getattr__` delegates anything else (fileno, buffer,
+    writable, …) to sys.stderr so a stray caller that reaches for a raw handle
+    still lands on stderr instead of fd 1."""
+
+    def write(self, s):
+        try:
+            sys.stderr.write(s)
+            sys.stderr.flush()
+        except Exception:
+            pass
+        return len(s)
+
+    def flush(self):
+        try:
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        return False
+
+    def __getattr__(self, name):
+        return getattr(sys.stderr, name)
+
+
 @contextmanager
 def _stdout_to_stderr():
-    """Redirect stdout to stderr while the pipeline runs — at BOTH levels.
+    """Route the pipeline's stdout to stderr for one tool call — OBJECT-LEVEL.
 
-    fd-level: catches subprocesses and anything holding the raw handle.
-    Object-level: catches buffered print() output that would otherwise sit in
-    sys.stdout's buffer and flush into the JSON-RPC channel after restore.
+    The previous version also did fd-level `os.dup2(2, 1)`, which retargeted
+    fd 1 to stderr for the whole call. But the MCP stdio transport captured
+    `sys.stdout.buffer` (fd 1) at server startup, so EVERY JSON-RPC frame
+    written during the run — the tool result AND any progress/keep-alive
+    notifications — went to stderr and never reached the client. The client saw
+    a silent channel and idle-timed-out the call ("MCP tool timed out").
+
+    Rebinding `sys.stdout` alone keeps fd 1 pristine so those frames still reach
+    the client, while every `print()` in the pipeline goes to stderr. This is
+    safe because all subprocesses in the hot path (forge, z3, solc) are spawned
+    with capture_output=True, so none inherits fd 1.
     """
-    sys.stdout.flush()
-    saved_fd = os.dup(1)
-    saved_stdout = sys.stdout
-    os.dup2(2, 1)
-    sys.stdout = sys.stderr
+    saved = sys.stdout
+    sys.stdout = _StderrSink()
     try:
         yield
     finally:
         try:
-            sys.stdout.flush()
+            sys.stderr.flush()
         except Exception:
             pass
-        sys.stdout = saved_stdout
-        os.dup2(saved_fd, 1)
-        os.close(saved_fd)
+        sys.stdout = saved
+
+
+async def _run_with_heartbeat(run_blocking, emit, interval):
+    """Run the blocking callable `run_blocking` in a worker thread while calling
+    `await emit(n)` every `interval` seconds until it finishes.
+
+    Returns run_blocking()'s result and re-raises its exception. `emit` errors
+    are swallowed (a keep-alive must never fail the audit). `interval <= 0`
+    disables heartbeats and simply awaits the worker (guarding against a
+    busy-spin). The worker thread is not cancellable, so a client disconnect
+    still lets the pipeline finish in the background — unchanged from before.
+    """
+    if not interval or interval <= 0:
+        return await anyio.to_thread.run_sync(run_blocking)
+
+    box: dict = {}
+    done = anyio.Event()
+
+    async def _worker():
+        try:
+            box["result"] = await anyio.to_thread.run_sync(run_blocking)
+        except Exception as exc:  # re-raised to the caller after the loop ends
+            box["error"] = exc
+        finally:
+            done.set()
+
+    n = 0
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(_worker)
+        while not done.is_set():
+            with anyio.move_on_after(interval):
+                await done.wait()
+            if done.is_set():
+                break
+            n += 1
+            try:
+                await emit(n)
+            except Exception:
+                pass
+
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
+
+
+def _mode_label(target: str, prior_findings, instructions: str) -> str:
+    """Human-readable mode for the keep-alive message (mirrors the dispatcher)."""
+    if prior_findings:
+        return "re-confirm"
+    if instructions:
+        return "directed hypothesis"
+    if target:
+        return f"scoped audit ({target})"
+    return "full audit"
+
+
+def _make_emitter(ctx: Context, mode: str):
+    """Build the per-call keep-alive emitter.
+
+    report_progress only reaches clients that sent a progressToken; ctx.info
+    (an MCP logging notification) reaches ALL clients by default. Emitting both
+    guarantees the channel shows activity regardless of client capability, which
+    is what stops an idle-timeout during the multi-minute Z3 + Foundry run.
+    """
+    started = time.monotonic()
+
+    async def emit(n: int) -> None:
+        elapsed = time.monotonic() - started
+        msg = f"Gödel {mode}: {elapsed:.0f}s elapsed, still verifying (heartbeat {n})"
+        try:
+            await ctx.report_progress(n, None, msg)
+        except Exception:
+            pass
+        try:
+            await ctx.info(msg)
+        except Exception:
+            pass
+
+    return emit
 
 
 @mcp.tool()
-def audit_contract(
+async def audit_contract(
+    ctx: Context,
     contract_code: str,
     readme: str = "",
     target: str = "",
@@ -103,17 +225,28 @@ def audit_contract(
     fragment that needs external imports or base contracts still requires the
     surrounding code.
 
+    This is a long-running call (Z3 + Foundry + LLM). It emits MCP progress /
+    logging notifications while it works, so keep the connection open rather
+    than treating a period without a final result as a timeout.
+
     Returns a list of finding dicts (contract, function, severity, summary,
     counterexample, z3 proof, Foundry PoC, forge output, fix, qc_status, ...).
     """
-    with _stdout_to_stderr():
-        return run_pipeline_code(
-            contract_code,
-            readme,
-            target=target,
-            prior_findings=prior_findings,
-            instructions=instructions,
-        )
+    mode = _mode_label(target, prior_findings, instructions)
+
+    def _blocking():
+        with _stdout_to_stderr():
+            return run_pipeline_code(
+                contract_code,
+                readme,
+                target=target,
+                prior_findings=prior_findings,
+                instructions=instructions,
+            )
+
+    return await _run_with_heartbeat(
+        _blocking, _make_emitter(ctx, mode), config.MCP_HEARTBEAT_SECONDS
+    )
 
 
 if __name__ == "__main__":

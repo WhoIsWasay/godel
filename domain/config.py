@@ -120,6 +120,17 @@ DISCOVERY_MAX_INVARIANTS = _env_int("GODEL_DISCOVERY_MAX", 4)
 Z3_TIMEOUT_SECONDS   = _env_float("GODEL_Z3_TIMEOUT", 30.0)
 FORGE_TIMEOUT_SECONDS = _env_float("GODEL_FORGE_TIMEOUT", 45.0)
 
+# MCP keep-alive heartbeat. A re-confirm/full audit runs Z3 (<=Z3_TIMEOUT) +
+# Foundry (<=FORGE_TIMEOUT) + several LLM calls — often minutes. The MCP stdio
+# transport captured sys.stdout at startup, and MCP clients apply a request/
+# idle timeout (SDK default ~60s): a silent channel makes them abort the call
+# mid-run ("MCP tool timed out") after credits were already spent. While the
+# tool runs the server emits a notification every MCP_HEARTBEAT_SECONDS so the
+# channel always shows activity — report_progress for clients that pass a
+# progressToken, plus a token-independent logging notification for all others.
+# Set to 0 to disable.
+MCP_HEARTBEAT_SECONDS = _env_float("GODEL_MCP_HEARTBEAT_SECONDS", 5.0)
+
 # ==========================================
 # Z3 WITNESS MINIMIZATION (groundability)
 # ==========================================
