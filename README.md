@@ -8,15 +8,20 @@ Gödel bridges high-reasoning LLMs with deterministic SMT theorem proving (**Z3*
 
 ---
 
-## 📊 Measured Results (planted-bug corpus)
+## 📊 Measured Results
 
-7 seeded contracts, 23 planted vulnerabilities — audited end-to-end:
+8 benchmark contracts · 27 planted bugs — audited end-to-end (live, auto-computed stats: [godel-site](https://whoiswasay.github.io/godel-site/)):
 
 | Metric | Value |
 |---|---|
-| Bugs caught | **20 / 23 (87%)** |
+| Bugs caught | **23 / 27 (85.2%)** |
+| MiniVault | **4 / 4 (100%)** |
 | False positives reported | **0** |
 | Largest contract | 461 LOC |
+
+**MiniVault (100% catch, 0 false positives)** — all 4 bugs found and forge-confirmed on a 72-LOC yield vault: a non-zero deposit minting zero shares at a high share price; a flat-500 instead of 5% emergency-withdrawal penalty (underflows positions under 500); a floor-division zero-share-burn in `withdraw` that lets a caller extract assets while burning no shares; and orphaned assets left behind when the last shareholder exits. Evidence: [godel-audit-results/MiniVault](https://github.com/WhoIsWasay/godel-audit-results/tree/main/MiniVault).
+
+**Real-world validation — Code4rena PoolTogether V3 (2021-06):** matched 2 known high-severity findings from the original human audit and independently found 2 real precision-loss bugs that were absent from the C4 report. Every finding ships with a Z3 proof + an on-chain Foundry exploit test.
 
 Full per-contract breakdown: [godel-site](https://whoiswasay.github.io/godel-site/) · artifacts under `output/` and `cache/fuzz/failures/`.
 
@@ -106,4 +111,4 @@ MCP integration for AI assistants: `python mcp_server.py` (see header of that fi
 | `GODEL_SUPERVISOR_MAX_ITERATIONS` | `3` | Bounds the supervisor critique loop |
 
 ---
-Built By Wasay. August 2026.
+Built By Wasay. September 2026.
