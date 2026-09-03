@@ -27,7 +27,132 @@ def is_compile_failure(combined_output: str, stdout: str) -> bool:
     return any(m in combined_output for m in markers) and not has_executed_tests(stdout)
 
 
-def classify_forge_json(stdout_text: str, combined_output: str = ""):
+# =========================================================================
+# INVARIANT WARM-UP RESCUE (MiniVault deposit re-confirm post-mortem)
+#
+# A PoC for a deterministic exploit is often written as an *invariant* test
+# (StdInvariant + `invariant_*`) whose body drives the real state sequence
+# through public calls and then asserts the SAFE invariant. When that assert
+# fires, the exploit has genuinely reproduced on the EVM. But Foundry reports
+# an assertion that reverts during the invariant harness warm-up as:
+#
+#     status: Failure
+#     reason: "failed to set up invariant testing environment: <assert msg>: 0 <= 0"
+#     kind:   Invariant, runs: 0
+#
+# The blanket setUp-marker pre-check used to map ANY output containing
+# "failed to set up invariant" to harness_error BEFORE reading the structured
+# JSON — so a real reproduction was routed into the "fix setUp()" heal loop
+# (setUp is fine; nothing to heal) and eventually shipped as [UNVERIFIED]
+# informational. The revert reason that reaches us is the PoC's OWN assertion
+# message, which is the strongest possible signal that the property check ran
+# and failed. We rescue it here:
+#
+#   - only genuinely unreachable harness problems stay harness_error:
+#     vm.etch on a precompile, missing selector, setUp() revert, or an
+#     invariant warm-up failure whose inner reason is NOT one of the PoC's
+#     assertion messages (i.e. an infra/deploy/constructor problem).
+#   - a warm-up failure whose inner reason IS an assertion message present in
+#     the PoC test code and overlapping the finding's property wording is a
+#     clean EVM reproduction -> confirmed.
+# =========================================================================
+_INVARIANT_SETUP_PREFIX = "failed to set up invariant testing environment"
+
+_HARD_INFRA_MARKERS = (
+    "vm.etch: cannot use precompile",
+    "does not have the selector",
+    "setUp() must be",
+)
+
+_SETUP_FAIL_MARKERS = (
+    "setup failed", "set failed", "failed to set up",  # lowercased match
+)
+
+_NUMERIC_ASSERT_TAIL_RE = re.compile(r":\s*\d+\s*(<=|>=|!=|==|<|>)\s*\d+\s*$")
+
+_PROPERTY_STOPWORDS = frozenset(
+    "this that with from the and when after before must should have into "
+    "than then not null true false error failed".split()
+)
+
+# When the raw combined output is scanned (legacy text path) the assertion
+# message is followed by JSON/forge noise; cut at the first of these delimiters.
+_BOUNDARY_CUTS = ('","', '"}', '"', "\n")
+
+
+def _property_candidate(reason_text: str) -> str:
+    """Pull the assertion message out of a forge failure reason.
+
+    Handles the invariant warm-up wrapper (`failed to set up invariant testing
+    environment: <msg>: 0 <= 0`) and strips forge-std's numeric comparison
+    tail (": a <= b"). When fed a chunk of combined output, also cuts at JSON
+    boundaries / newlines so only the message on the same line survives."""
+    t = (reason_text or "")
+    if _INVARIANT_SETUP_PREFIX in t:
+        t = t.split(_INVARIANT_SETUP_PREFIX, 1)[1]
+        t = t.lstrip(": \"").strip()
+        for cut in _BOUNDARY_CUTS:
+            if cut in t:
+                t = t.split(cut, 1)[0].rstrip().rstrip(":")
+                break
+    t = _NUMERIC_ASSERT_TAIL_RE.sub("", t).strip()
+    return t.strip()
+
+
+def _overlaps_property_wording(message: str, finding_intent: str) -> bool:
+    """True when the assertion message shares >= 2 significant words with the
+    finding's property wording. Property asserts echo the invariant/intent
+    ("positive deposit minted zero shares"); state-precondition asserts and
+    infra/constructor errors do not ("witness totalSupply mismatch")."""
+    hay = (finding_intent or "").lower()
+    if not hay or len(message) < 5:
+        return False
+    tokens = [t for t in re.findall(r"[A-Za-z][A-Za-z0-9]{3,}", message)
+              if t.lower() not in _PROPERTY_STOPWORDS]
+    if not tokens:
+        return False
+    hits = sum(1 for t in tokens if t.lower() in hay)
+    return hits >= 2
+
+
+def _property_assertion_fired(reason_text: str, test_code: str, finding_intent: str) -> bool:
+    """A warm-up failure whose inner reason is the PoC's own safe-invariant
+    assertion message (present in the test code AND overlapping the finding's
+    wording) is an EVM reproduction of the bug, not a harness problem."""
+    if not reason_text or _INVARIANT_SETUP_PREFIX not in reason_text:
+        return False
+    cand = _property_candidate(reason_text)
+    if not cand or len(cand) > 160:
+        return False
+    code = test_code or ""
+    if cand not in code:
+        return False
+    return _overlaps_property_wording(cand, finding_intent)
+
+
+def _classify_failure_reason(reason_text: str, test_code: str = "", finding_intent: str = ""):
+    """Map one forge Failure reason to a verdict hint:
+      'confirmed'     -> the PoC's own safe-invariant assertion fired on the EVM
+      'harness_error' -> genuine setUp/infra problem (test never meaningfully ran)
+      None            -> undecidable here; caller uses the structural default."""
+    if not reason_text:
+        return None
+    if _property_assertion_fired(reason_text, test_code, finding_intent):
+        return "confirmed"
+    lowered = reason_text.lower()
+    if _INVARIANT_SETUP_PREFIX in reason_text:
+        # Warm-up failure whose inner reason is NOT one of the PoC's property
+        # assertions (deploy/constructor/mock/cheatcode problem) — keep it a
+        # harness error, never guess.
+        return "harness_error"
+    if any(m in lowered for m in _HARD_INFRA_MARKERS) or any(
+            m in lowered for m in _SETUP_FAIL_MARKERS):
+        return "harness_error"
+    return None
+
+
+def classify_forge_json(stdout_text: str, combined_output: str = "",
+                        test_code: str = "", finding_intent: str = ""):
     """Structured verdict from a `forge test --json` report.
 
     Returns (verdict, n_tests) with verdict in {'confirmed', 'property_held',
@@ -38,17 +163,12 @@ def classify_forge_json(stdout_text: str, combined_output: str = ""):
     the boolean 'success' field with 'status': 'Success'/'Failure' — both are
     collected.
 
-    setUp failures (vm.etch precompile, selector errors, etc.) are classified
-    as harness_error, NOT confirmed — a test that never ran cannot disprove
-    an invariant."""
-    setUp_error_markers = (
-        "setUp failed", "Setup failed", "SETUP FAILED",
-        "vm.etch: cannot use precompile", "does not have the selector",
-        "failed to set up invariant", "setUp() must be",
-    )
-    if any(m in combined_output for m in setUp_error_markers):
-        return ("harness_error", 0)
-
+    setUp/infra failures (vm.etch precompile, selector errors, setUp reverts)
+    are classified as harness_error, NOT confirmed — a test that never ran
+    cannot disprove an invariant. Exception: an invariant warm-up failure whose
+    revert reason is the PoC's own safe-invariant assertion message is a real
+    EVM reproduction and is returned as 'confirmed' (see the rescue block
+    above). `test_code` and `finding_intent` are used to tell the two apart."""
     s = (stdout_text or "").strip()
     if not (s.startswith("{") or s.startswith("[")):
         return None
@@ -58,6 +178,7 @@ def classify_forge_json(stdout_text: str, combined_output: str = ""):
         return None
 
     results = []
+    failure_reasons = []
 
     def _walk(node, key=None):
         if key == "traces":
@@ -66,6 +187,8 @@ def classify_forge_json(stdout_text: str, combined_output: str = ""):
             status = node.get("status")
             if isinstance(status, str) and status in ("Success", "Failure"):
                 results.append(status == "Success")
+                if status == "Failure" and isinstance(node.get("reason"), str):
+                    failure_reasons.append(node["reason"])
             elif isinstance(node.get("success"), bool):
                 results.append(node["success"])
             for k, v in node.items():
@@ -75,11 +198,34 @@ def classify_forge_json(stdout_text: str, combined_output: str = ""):
                 _walk(v, key)
 
     _walk(data)
-    if not results:
+    if not results and not failure_reasons:
         return ("harness_error", 0)
-    if any(r is False for r in results):
-        return ("confirmed", len(results))
-    return ("property_held", len(results))
+
+    n_tests = len(results) if results else len(failure_reasons)
+
+    for reason in failure_reasons:
+        hint = _classify_failure_reason(reason, test_code, finding_intent)
+        if hint == "harness_error":
+            # A genuinely unreachable setUp/infra problem anywhere in the run
+            # overrides any sibling success — never read it as a bug.
+            return ("harness_error", 0)
+        # 'confirmed' hints accumulate below; None defers to the bools.
+    confirmed_via_reason = any(
+        _classify_failure_reason(r, test_code, finding_intent) == "confirmed"
+        for r in failure_reasons)
+
+    # Infra markers that appear outside a per-test reason (e.g. a nested
+    # setup node) must still cap the verdict — unless a property assertion
+    # already proved the bug, in which case the reproduction wins.
+    if not confirmed_via_reason:
+        lowered = (combined_output or "").lower()
+        if any(m in lowered for m in _HARD_INFRA_MARKERS) or any(
+                m in lowered for m in _SETUP_FAIL_MARKERS):
+            return ("harness_error", 0)
+
+    if confirmed_via_reason or any(r is False for r in results):
+        return ("confirmed", n_tests)
+    return ("property_held", n_tests)
 
 
 def downgrade_forced_confirmation(verdict: str, test_code: str) -> str:
@@ -95,6 +241,23 @@ def downgrade_forced_confirmation(verdict: str, test_code: str) -> str:
         return verdict
     from domain.schema import detect_forced_state
     return "confirmed_forced" if detect_forced_state(test_code) else verdict
+
+
+def _finding_property_wording(finding) -> str:
+    """Concatenate the natural-language description of the property under test
+    from a finding dict (both OUTPUT shape and INPUT shape keys). Used to
+    recognize the PoC's safe-invariant assertion message inside a forge
+    failure reason."""
+    if not isinstance(finding, dict):
+        return ""
+    parts = [
+        finding.get("intent"), finding.get("summary"),
+        finding.get("constraint"), finding.get("root_cause"),
+        finding.get("relevant_code"), finding.get("invariant"),
+        finding.get("title"),
+    ]
+    text = " ".join(str(p) for p in parts if p)
+    return text[:1500]
 
 
 class FoundryGatekeeper:
@@ -199,7 +362,7 @@ class FoundryGatekeeper:
         except Exception as e:
             logger.warning("[GATEKEEPER WARNING] Could not write debug artifact: %s", e)
 
-    def execute_qc_validation(self, initial_test_code: str, max_retries: int = None, debug_tag: str = "candidate", debug_dir: str = None, legacy: bool = False, target_source: str = None) -> tuple:
+    def execute_qc_validation(self, initial_test_code: str, max_retries: int = None, debug_tag: str = "candidate", debug_dir: str = None, legacy: bool = False, target_source: str = None, finding: dict = None) -> tuple:
         """Runs Forge against the candidate test suite. Returns (status, forge_output).
 
         legacy=True means the target's pragma excludes solc >= 0.8.13, so
@@ -207,11 +370,14 @@ class FoundryGatekeeper:
         deterministically instead of burning a doomed forge invocation.
         target_source (when given alongside legacy) enables the deterministic
         pragma-conflict pre-check: a suite whose pragma shares no solc version
-        with the target can never compile."""
+        with the target can never compile. `finding` supplies the property
+        wording used to tell an invariant warm-up assertion failure (a real EVM
+        reproduction -> confirmed) apart from a genuine setUp/infra problem."""
         if max_retries is None:
             max_retries = config.GATEKEEPER_MAX_RETRIES
         from domain.solc_compat import LEGACY_HEAL_HINT
         current_test_code = initial_test_code
+        finding_intent = _finding_property_wording(finding)
         
         # ðŸš€ THREAD-SAFE DYNAMIC FILENAMES
         unique_id = uuid.uuid4().hex[:6]
@@ -323,7 +489,9 @@ class FoundryGatekeeper:
                     # 2c. STRUCTURED VERDICT: when forge produced a valid JSON
                     # report, classify from it (robust against prose changes
                     # in human-readable output). None -> legacy heuristics.
-                    structured = classify_forge_json(stdout, combined_output)
+                    structured = classify_forge_json(
+                        stdout, combined_output,
+                        test_code=current_test_code, finding_intent=finding_intent)
                     if structured is not None:
                         verdict, n_tests = structured
                         verdict = downgrade_forced_confirmation(verdict, current_test_code)
@@ -349,11 +517,14 @@ class FoundryGatekeeper:
 
                     # 3. SUCCESSFUL EXECUTION: Did the property break? (Bug Proven)
                     if result.returncode != 0 and "FAIL" in stdout:
-                        setUp_markers = ("setUp failed", "Setup failed",
-                                         "vm.etch: cannot use precompile",
-                                         "does not have the selector",
-                                         "failed to set up invariant")
-                        if any(m in combined_output for m in setUp_markers):
+                        # A setUp-phase revert can be a genuine harness problem
+                        # (vm.etch on a precompile, wrong constructor args, ...)
+                        # OR the PoC's own safe-invariant assertion firing inside
+                        # the invariant warm-up — which is an EVM reproduction.
+                        # Only the former is a harness_error; the latter is a bug.
+                        hint = _classify_failure_reason(
+                            combined_output, current_test_code, finding_intent)
+                        if hint == "harness_error":
                             print("      [GATEKEEPER ERROR] Test failed at setUp — "
                                   "harness problem, NOT a confirmed bug.")
                             self._dump_debug_artifact(debug_tag, attempt, current_test_code, combined_output, debug_dir)
@@ -361,6 +532,8 @@ class FoundryGatekeeper:
                         verdict = downgrade_forced_confirmation("confirmed", current_test_code)
                         if verdict == "confirmed_forced":
                             print("      [QC FORCED-STATE] Invariant broke, but the PoC force-constructs the storage state (vm.store/vm.etch). Natural reachability NOT proven — flagging for manual review, not a clean confirmation.")
+                        elif hint == "confirmed":
+                            print("      [QC PASSED] Invariant warm-up assertion failed — the PoC's own property check reproduced the bug on the EVM!")
                         else:
                             print("      [QC PASSED] Invariant broken successfully. Defect is active and verified!")
                         self._dump_debug_artifact(debug_tag, attempt, current_test_code, combined_output, debug_dir)

@@ -704,7 +704,7 @@ def _gatekeeper_verify(state, gatekeeper, finding, remaining_findings,
         print("      [GATEKEEPER] Legacy solc target detected — using forge-std-free verification harness.")
     qc_status, forge_output = gatekeeper.execute_qc_validation(
         test_suite, debug_tag=f"{real_contract_name}_verify", debug_dir=finding_dir,
-        legacy=legacy, target_source=state["user_contract"])
+        legacy=legacy, target_source=state["user_contract"], finding=finding)
     
     if qc_status == "confirmed":
         new_bug = {
