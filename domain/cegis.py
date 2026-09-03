@@ -32,6 +32,19 @@ _CEX_PAIR_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_$.]*)\s*[:=]\s*(-?\d+)")
 _BUILD_MODEL_CALL_RE = re.compile(r"\bbuild_model\(\s*\)")
 
 
+def _is_timeout(result: dict) -> bool:
+    """True when a run_z3 result is a Z3 TIMEOUT (subprocess killed at
+    Z3_TIMEOUT_SECONDS), as opposed to a syntax/NameError/quality-gate failure.
+
+    A timeout means the property is undecidable-or-slow for Z3 (nonlinear
+    integer arithmetic over unbounded Int symbols). NO rewrite fixes that — an
+    LLM "repair" just hands back another script that times out again. Callers
+    use this to stop spending money/time on a futile repair loop and to mark the
+    verdict terminal-inconclusive instead of looping back to the specifier."""
+    return (result.get("status") == "error"
+            and "timeout" in (result.get("error") or "").lower())
+
+
 def _inject_witness_bound(z3_code: str, bound: int) -> str:
     """Rewrites build_model() -> build_model(witness_bound=<bound>) so the SAME
     composed harness script re-solves with every uint256 symbol additionally
@@ -78,10 +91,13 @@ class CEGIS:
 
         # A Z3 timeout on an unbounded nonlinear property never resolves by
         # rewriting it — every LLM repair re-runs a still-unbounded script that
-        # times out again (this spun the seeded deposit re-confirm through ~6 min
-        # of 30s timeouts to analysis_incomplete). Bound the harness symbols and
-        # re-solve deterministically BEFORE spending the repair budget.
-        if result.get("status") == "error" and "timeout" in (result.get("error") or "").lower():
+        # times out again (this spun the seeded deposit re-confirm through ~12 min
+        # of 30s timeouts + two ~2.5-min DeepSeek repairs to analysis_incomplete).
+        # Bound the harness symbols and re-solve deterministically ONCE; if that
+        # still times out, the property is undecidable for Z3 and we STOP — the
+        # `not _is_timeout(result)` guard on the repair loop below prevents any
+        # LLM spend on a timeout.
+        if _is_timeout(result):
             bounded = self._retry_with_witness_bound(z3_code, attempts)
             if bounded is not None:
                 z3_code = bounded.get("z3_code") or z3_code
@@ -89,7 +105,8 @@ class CEGIS:
 
         repairs = 0          # LLM repairs (bounded by max_repairs)
         deterministic = 0    # LLM-free NameError fixes (bounded too)
-        while result.get("status") == "error" and repairs < max_repairs:
+        while result.get("status") == "error" and not _is_timeout(result) \
+                and repairs < max_repairs:
             error = result.get("error") or ""
             fixed = None
             kind = None
@@ -118,9 +135,10 @@ class CEGIS:
                              "status": result.get("status"),
                              "error": result.get("error")})
             # An LLM repair can hand back a still-unbounded nonlinear property
-            # that times out again. Bound + re-solve deterministically before the
-            # next repair so a decidable witness is found without burning budget.
-            if result.get("status") == "error" and "timeout" in (result.get("error") or "").lower():
+            # that times out again. Bound + re-solve deterministically once; if it
+            # is STILL a timeout the loop condition (`not _is_timeout`) exits on the
+            # next check, so no further LLM budget is spent.
+            if _is_timeout(result):
                 bounded = self._retry_with_witness_bound(z3_code, attempts)
                 if bounded is not None:
                     z3_code = bounded.get("z3_code") or z3_code
@@ -139,6 +157,13 @@ class CEGIS:
             result["counterexample"] = cex
         else:
             result["counterexample"] = None
+
+        # Terminal marker for the graph router, stamped on the FINAL result: the
+        # property is undecidable for Z3 within the timeout (nonlinear Int
+        # arithmetic). This is INCONCLUSIVE — not a safety proof and not a
+        # confirmed bug — so route_after_executor ends the graph instead of
+        # re-queueing a futile specifier regeneration.
+        result["z3_timeout"] = _is_timeout(result)
 
         if attempts:
             z3_repair.persist_repair_log(config.DEBUG_FOLDER, focus_function,
@@ -162,9 +187,12 @@ class CEGIS:
         Soundness: each rung only ADDS `sym <= B` to the identical property, so a
         bounded SAT is a valid witness (the concrete Forge PoC remains the final
         ground-truth check). A bounded UNSAT is NOT a safety proof — the violation
-        may need magnitude above B — so only SAT is ever returned; UNSAT/error
-        loosen the bound and, failing that, return None to fall through to the
-        normal LLM repair path. No LLM call."""
+        may need magnitude above B — so only SAT is ever returned and UNSAT
+        loosens the bound. A bounded TIMEOUT breaks the loop: the bounds ascend,
+        so a larger domain is strictly harder and would also time out — continuing
+        just burns 3 more Z3_TIMEOUT_SECONDS solves. Failing a SAT, return None to
+        fall through (the caller's `not _is_timeout` guard then ends the run rather
+        than spending an LLM repair). No LLM call."""
         if "build_model(" not in z3_code:
             return None  # standalone / LLM-improvised script: no bound hook
         for bound in config.WITNESS_TIMEOUT_BOUNDS:
@@ -182,8 +210,14 @@ class CEGIS:
                       f"— bounded nonlinear problem is decidable; SAT witness found "
                       f"(no LLM repair)")
                 return attempt
-        print("      [CEGIS] witness-bounded re-solves found no SAT — falling "
-              "back to guided repair")
+            if _is_timeout(attempt):
+                # Smallest undecidable bound => every larger bound is harder too.
+                print(f"      [CEGIS] witness_bound <= {bound} still timed out — "
+                      f"larger bounds are strictly harder; stopping bounded rescue "
+                      f"(no further 30s solves, no LLM repair)")
+                break
+        print("      [CEGIS] witness-bounded re-solves found no SAT — ending "
+              "without an LLM repair (a timeout is not rewrite-fixable)")
         return None
 
     def _minimize_witness(self, z3_code: str, cex: dict, attempts: list) -> dict | None:

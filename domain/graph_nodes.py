@@ -597,6 +597,19 @@ def executor_node(state: GraphState, cegis_tool: CEGIS):
         )
         updates["messages"] = [AIMessage(
             content="[EXECUTOR]: VACUOUS — over-constrained base model. Regenerating property.")]
+    elif result.get("z3_timeout"):
+        # Undecidable/slow nonlinear property — terminal INCONCLUSIVE. The router
+        # ENDs on z3_timeout, so this critique is never fed back for regeneration;
+        # it exists only so logs/artifacts describe the outcome honestly (a timeout
+        # is NOT a syntax error and no rewrite can fix it).
+        updates["supervisor_critique"] = (
+            "Z3 TIMEOUT: the property is nonlinear integer arithmetic that Z3 could "
+            "not decide within the timeout, even after bounding the witness domain. "
+            "INCONCLUSIVE — neither proven safe nor confirmed."
+        )
+        updates["messages"] = [AIMessage(
+            content="[EXECUTOR]: Z3 TIMEOUT — inconclusive; ending without a futile "
+                    "specifier regeneration or LLM repair.")]
     else:
         updates["supervisor_critique"] = f"Z3 Syntax/Execution Error:\n{result['error']}"
         updates["messages"] = [AIMessage(content="[EXECUTOR]: ERROR during execution. Needs refinement.")]

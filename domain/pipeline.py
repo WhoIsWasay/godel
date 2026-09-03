@@ -606,6 +606,17 @@ def route_after_specifier(state: GraphState) -> str:
 def route_after_executor(state: GraphState) -> str:
     res = state.get("z3_result", {}) or {}
     status = res.get("status")
+    if res.get("z3_timeout"):
+        # Z3 could not decide the property within Z3_TIMEOUT_SECONDS even after
+        # the bounded witness rescue (nonlinear integer arithmetic over unbounded
+        # Int symbols). This is INCONCLUSIVE and NOT repairable by regeneration:
+        # the specifier cannot make an undecidable property decidable, and every
+        # retry burns a ~2.5-min LLM call plus more 30s timeouts. Left as a
+        # generic "error" below, the router would re-queue it up to
+        # EXECUTOR_MAX_ITERATIONS times — that outer loop is what ran the seeded
+        # MiniVault deposit re-confirm for ~an hour. End now; _collect_state_result
+        # surfaces an honest incomplete artifact for the still-queued finding.
+        return END
     # A vacuous UNSAT reads status="unsat" but is NOT a verdict — the vacuity
     # probe found the base model over-constrained, so nothing was proven. The
     # executor keeps that finding queued for regeneration and never consumes
@@ -788,11 +799,15 @@ def _should_flag_incomplete(final_state: dict) -> str | None:
     represents an aborted/incomplete analysis rather than a genuine verdict,
     else None. Ironclad guarantee: results contain only verified bugs,
     proven-safe verdicts, or explicit incomplete/error artifacts."""
+    res = final_state.get("z3_result", {}) or {}
+    if res.get("z3_timeout"):
+        return ("Z3 could not decide the property within the timeout (nonlinear "
+                "integer arithmetic), even after bounding the witness domain — "
+                "INCONCLUSIVE: neither disproven nor confirmed")
     if final_state.get("hunter_parse_error") and not final_state.get("findings"):
         return "bug hunter output remained unparseable after retries"
     if final_state.get("findings"):
         return f"{len(final_state['findings'])} proposed finding(s) left unprocessed when the graph aborted"
-    res = final_state.get("z3_result", {}) or {}
     if (final_state.get("executor_runs", 0) >= config.EXECUTOR_MAX_ITERATIONS
             and res.get("status") in ("error", "inconclusive", "vacuous")):
         return f"executor exhausted {config.EXECUTOR_MAX_ITERATIONS} retries without a verdict"
@@ -1510,7 +1525,21 @@ def _collect_state_result(final_state: dict, stem: str, results: list):
         reason = _should_flag_incomplete(final_state)
         if reason:
             print(f"      [IRONCLAD] {focus_func}: surfacing incomplete-analysis artifact ({reason})")
-            results.append(_incomplete_finding(stem, focus_func, reason))
+            leftover = (final_state.get("findings") or [None])[0]
+            if leftover:
+                # Preserve the supplied/proposed finding's REAL content (intent,
+                # severity_guess, counterexample) and the true contract name,
+                # marked honestly incomplete — instead of a generic stub that
+                # discards the human's hypothesis (the "contract":"contract" /
+                # generic-severity complaint on the seeded MiniVault re-confirm).
+                # build_finding caps severity to informational since it is unverified.
+                artifact = build_finding(leftover, final_state, "", "", "",
+                                         "analysis_incomplete")
+                artifact["summary"] = f"{reason}. {leftover.get('intent', '')}".strip()
+                artifact.setdefault("metadata", {})["incomplete_reason"] = reason
+                results.append(artifact)
+            else:
+                results.append(_incomplete_finding(stem, focus_func, reason))
 
 
 def _collect_future_result(future, func_name: str, stem: str, results: list):
@@ -1557,11 +1586,36 @@ def _autowrap_contract(code: str) -> str:
     ])
 
 
+def _contract_name_from_code(code: str) -> str | None:
+    """Best-effort REAL contract name from Solidity source, used to label
+    findings and name the materialized .sol file. Returns None when it cannot be
+    determined (no non-abstract `contract <Name>`, or the comment-masking
+    dependency is unavailable) so the caller falls back to a generic stem.
+
+    Root fix for findings mislabeled `"contract": "contract"`: the MCP/seeded path
+    used to write a hardcoded `contract.sol`, so `Path(sol_path).stem` was always
+    the literal "contract" regardless of the real contract (e.g. MiniVault). Both
+    the seeded stem and the cold `collect_sol_files` fallback derive the name from
+    this filename, so naming it correctly fixes both."""
+    if not code:
+        return None
+    try:
+        from domain.gatekeeper import FoundryGatekeeper
+        return FoundryGatekeeper.extract_contract_name(code)
+    except Exception:
+        return None
+
+
 def _write_contract_files(tmpdir: str, contract_code: str, readme: str):
     """Materialize code (+ optional readme) into tmpdir. Returns (sol_path,
-    final_code) where final_code is the auto-wrapped source actually written."""
+    final_code) where final_code is the auto-wrapped source actually written.
+
+    The file is named after the REAL contract (falling back to `contract.sol`) so
+    downstream `Path(sol_path).stem` yields the true contract name for finding
+    labels instead of the generic literal "contract"."""
     code = _autowrap_contract(contract_code)
-    sol_path = os.path.join(tmpdir, "contract.sol")
+    stem = _contract_name_from_code(code) or "contract"
+    sol_path = os.path.join(tmpdir, f"{stem}.sol")
     with open(sol_path, "w", encoding="utf-8") as f:
         f.write(code)
     if readme:
