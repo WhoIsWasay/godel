@@ -17,6 +17,10 @@ permissions:
 
 jobs:
   audit:
+    # Public-repo hardening: run the audit on PRs only when the PR comes from
+    # THIS repo. Pull requests from forks would otherwise trigger full audits
+    # on our hosted minutes (compute abuse) and are never trusted anyway.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
